@@ -1,0 +1,880 @@
+openapi: 3.1.0
+info:
+  title: Ephemeral VM Lab API
+  version: 1.0.0
+  description: >
+    REST API for the orion-complex Ephemeral VM Lab.
+    Manages disposable VM environments across libvirt (Linux) and
+    Apple Virtualization.framework (macOS) providers.
+
+servers:
+  - url: http://127.0.0.1:3000
+    description: Local development
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        provider: { type: string }
+        provider_subject: { type: string }
+        email: { type: string }
+        email_domain: { type: string }
+        display_name: { type: string }
+        role: { type: string, enum: [user, admin] }
+        disabled: { type: integer }
+        created_at: { type: integer }
+
+    Node:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        host_os: { type: string, enum: [linux, macos] }
+        host_arch: { type: string }
+        cpu_cores: { type: integer }
+        memory_bytes: { type: integer }
+        disk_bytes_total: { type: integer }
+        max_cpu_utilization_ratio: { type: number }
+        max_memory_utilization_ratio: { type: number }
+        max_disk_utilization_ratio: { type: number }
+        max_running_envs: { type: integer }
+        online: { type: integer }
+        last_heartbeat_at: { type: integer, nullable: true }
+
+    Image:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        provider: { type: string, enum: [libvirt, macos, virtualization] }
+        guest_os: { type: string }
+        guest_arch: { type: string }
+        base_image_id: { type: string, nullable: true }
+        created_at: { type: integer }
+
+    Environment:
+      type: object
+      properties:
+        id: { type: string }
+        image_id: { type: string }
+        owner_user_id: { type: string }
+        node_id: { type: string }
+        provider: { type: string }
+        guest_os: { type: string }
+        guest_arch: { type: string }
+        state:
+          type: string
+          enum: [creating, running, suspending, suspended, resuming, rebooting, migrating, destroying, failed]
+        created_at: { type: integer }
+        expires_at: { type: integer, nullable: true }
+        vcpus: { type: integer }
+        memory_bytes: { type: integer }
+        disk_bytes: { type: integer }
+
+    Snapshot:
+      type: object
+      properties:
+        id: { type: string }
+        env_id: { type: string }
+        name: { type: string, nullable: true }
+        created_at: { type: integer }
+
+    Task:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        state: { type: string, enum: [pending, running, completed, failed] }
+        created_at: { type: integer }
+        error_message: { type: string, nullable: true }
+        completed_at: { type: integer, nullable: true }
+        env_id: { type: string, nullable: true }
+
+    EnvironmentEvent:
+      type: object
+      properties:
+        id: { type: string }
+        env_id: { type: string }
+        event_type: { type: string }
+        from_state: { type: string, nullable: true }
+        to_state: { type: string, nullable: true }
+        triggered_by: { type: string, nullable: true }
+        message: { type: string, nullable: true }
+        created_at: { type: integer }
+
+    UserSshKey:
+      type: object
+      properties:
+        id: { type: string }
+        user_id: { type: string }
+        public_key: { type: string }
+        fingerprint: { type: string }
+        created_at: { type: integer }
+
+    NodeUsage:
+      type: object
+      properties:
+        node_id: { type: string }
+        environment_count: { type: integer }
+        max_environments: { type: integer }
+        vcpus_used: { type: integer }
+        vcpus_capacity: { type: integer }
+        memory_bytes_used: { type: integer }
+        memory_bytes_capacity: { type: integer }
+        disk_bytes_used: { type: integer }
+        disk_bytes_capacity: { type: integer }
+
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, default: 50, maximum: 200 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, default: 0 }
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  # ── Health ─────────────────────────────────────────────────────────
+
+  /v1/healthz:
+    get:
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Server is healthy
+
+  # ── Auth ───────────────────────────────────────────────────────────
+
+  /v1/auth/providers:
+    get:
+      summary: List enabled auth providers
+      security: []
+      responses:
+        '200':
+          description: List of providers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  providers:
+                    type: array
+                    items: { type: string }
+
+  /v1/auth/login:
+    post:
+      summary: Login via OIDC provider
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, access_token]
+              properties:
+                provider: { type: string, enum: [google, microsoft] }
+                access_token: { type: string }
+      responses:
+        '200':
+          description: Session token and user info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+
+  /v1/auth/me:
+    get:
+      summary: Get current user
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  # ── Users ──────────────────────────────────────────────────────────
+
+  /v1/users:
+    get:
+      summary: List users (admin only)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/User' }
+
+  /v1/users/{user_id}:
+    get:
+      summary: Get user details (admin only)
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /v1/users/{user_id}/role:
+    put:
+      summary: Update user role (admin only)
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { type: string, enum: [user, admin] }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /v1/users/{user_id}/disabled:
+    put:
+      summary: Enable/disable user (admin only)
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [disabled]
+              properties:
+                disabled: { type: boolean }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /v1/users/{user_id}/ssh-keys:
+    get:
+      summary: List SSH keys for a user (provisioning endpoint)
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UserSshKey' }
+
+  # ── SSH Keys ───────────────────────────────────────────────────────
+
+  /v1/ssh-keys:
+    get:
+      summary: List current user's SSH keys
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UserSshKey' }
+    post:
+      summary: Add SSH key
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [public_key]
+              properties:
+                public_key: { type: string }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserSshKey' }
+
+  /v1/ssh-keys/{key_id}:
+    delete:
+      summary: Delete SSH key
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Key deleted
+
+  # ── Nodes ──────────────────────────────────────────────────────────
+
+  /v1/nodes:
+    get:
+      summary: List nodes
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Node' }
+    post:
+      summary: Register node (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, host_os, host_arch, cpu_cores, memory_bytes, disk_bytes_total]
+              properties:
+                name: { type: string }
+                host_os: { type: string }
+                host_arch: { type: string }
+                cpu_cores: { type: integer }
+                memory_bytes: { type: integer }
+                disk_bytes_total: { type: integer }
+                max_cpu_utilization_ratio: { type: number }
+                max_memory_utilization_ratio: { type: number }
+                max_disk_utilization_ratio: { type: number }
+                max_running_envs: { type: integer }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+
+  /v1/nodes/{node_id}:
+    get:
+      summary: Get node details
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+    put:
+      summary: Update node (admin only)
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                max_cpu_utilization_ratio: { type: number }
+                max_memory_utilization_ratio: { type: number }
+                max_disk_utilization_ratio: { type: number }
+                max_running_envs: { type: integer }
+                online: { type: integer }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+    delete:
+      summary: Delete node (admin only, must have no active environments)
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Node deleted
+
+  /v1/nodes/{node_id}/heartbeat:
+    post:
+      summary: Node heartbeat
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Heartbeat recorded
+
+  /v1/nodes/{node_id}/usage:
+    get:
+      summary: Get node resource utilization
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeUsage' }
+
+  # ── Images ─────────────────────────────────────────────────────────
+
+  /v1/images:
+    get:
+      summary: List images
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Image' }
+    post:
+      summary: Register image (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, provider, guest_os, guest_arch]
+              properties:
+                name: { type: string }
+                provider: { type: string }
+                guest_os: { type: string }
+                guest_arch: { type: string }
+                base_image_id: { type: string }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Image' }
+
+  /v1/images/{image_id}:
+    get:
+      summary: Get image details
+      parameters:
+        - name: image_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Image' }
+    delete:
+      summary: Delete image (admin only, blocked if in use or has children)
+      parameters:
+        - name: image_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Image deleted
+
+  # ── Environments ───────────────────────────────────────────────────
+
+  /v1/environments:
+    get:
+      summary: List environments (owner-scoped for non-admins)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Environment' }
+    post:
+      summary: Create environment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image_id]
+              properties:
+                image_id: { type: string }
+                node_id: { type: string }
+                ttl_seconds: { type: integer }
+                vcpus: { type: integer, default: 2 }
+                memory_bytes: { type: integer, default: 4294967296 }
+                disk_bytes: { type: integer, default: 21474836480 }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+
+  /v1/environments/{env_id}:
+    get:
+      summary: Get environment details
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+    delete:
+      summary: Destroy environment
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Environment destruction initiated
+
+  /v1/environments/{env_id}/state:
+    put:
+      summary: Update environment state (for node agents)
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [state]
+              properties:
+                state: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+
+  /v1/environments/{env_id}/ssh-endpoint:
+    get:
+      summary: Get SSH connection info
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  env_id: { type: string }
+                  host: { type: string }
+                  port: { type: integer }
+
+  /v1/environments/{env_id}/vnc-endpoint:
+    get:
+      summary: Get VNC connection info
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  env_id: { type: string }
+                  host: { type: string }
+                  port: { type: integer }
+
+  /v1/environments/{env_id}/suspend:
+    post:
+      summary: Suspend environment (requires running state)
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+
+  /v1/environments/{env_id}/resume:
+    post:
+      summary: Resume environment (requires suspended state)
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+
+  /v1/environments/{env_id}/reboot:
+    post:
+      summary: Graceful reboot (requires running state)
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+
+  /v1/environments/{env_id}/force-reboot:
+    post:
+      summary: Force reboot (running, suspended, suspending, or resuming)
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+
+  /v1/environments/{env_id}/migrate:
+    post:
+      summary: Migrate environment to another node (requires suspended state)
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_node_id]
+              properties:
+                target_node_id: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+
+  /v1/environments/{env_id}/extend-ttl:
+    post:
+      summary: Extend or set environment TTL from now
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ttl_seconds]
+              properties:
+                ttl_seconds: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+
+  # ── Snapshots ──────────────────────────────────────────────────────
+
+  /v1/environments/{env_id}/snapshots:
+    get:
+      summary: List snapshots for environment
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Snapshot' }
+    post:
+      summary: Create snapshot (requires running or suspended state)
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Snapshot' }
+
+  /v1/environments/{env_id}/snapshots/{snapshot_id}:
+    delete:
+      summary: Delete snapshot
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: snapshot_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Snapshot deleted
+
+  /v1/environments/{env_id}/snapshots/{snapshot_id}/restore:
+    post:
+      summary: Restore snapshot (requires running or suspended state)
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: snapshot_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+
+  # ── Tasks ──────────────────────────────────────────────────────────
+
+  /v1/tasks:
+    get:
+      summary: List all tasks
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Task' }
+
+  /v1/tasks/{task_id}:
+    get:
+      summary: Get task details
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+
+  /v1/environments/{env_id}/tasks:
+    get:
+      summary: List tasks for a specific environment
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Task' }
+
+  # ── Events ─────────────────────────────────────────────────────────
+
+  /v1/environments/{env_id}/events:
+    get:
+      summary: List environment events (audit trail)
+      parameters:
+        - name: env_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EnvironmentEvent' }
