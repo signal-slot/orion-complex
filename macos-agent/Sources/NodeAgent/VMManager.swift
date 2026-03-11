@@ -193,6 +193,142 @@ final class VMManager {
         }
     }
 
+    // MARK: - Snapshots
+
+    func createSnapshot(envId: String, snapshotId: String) throws {
+        guard vms[envId] != nil else {
+            throw VMError.notFound(envId)
+        }
+
+        let bundlePath = "\(bundleStorePath)/\(envId).bundle"
+        let snapshotsDir = "\(bundlePath)/snapshots"
+        try FileManager.default.createDirectory(atPath: snapshotsDir, withIntermediateDirectories: true)
+
+        let snapshotPath = "\(snapshotsDir)/\(snapshotId)"
+        try FileManager.default.createDirectory(atPath: snapshotPath, withIntermediateDirectories: true)
+
+        // Copy the disk image as the snapshot
+        let diskPath = "\(bundlePath)/disk.img"
+        let snapshotDisk = "\(snapshotPath)/disk.img"
+        try FileManager.default.copyItem(atPath: diskPath, toPath: snapshotDisk)
+
+        logger.info("snapshot \(snapshotId) created for environment \(envId)")
+    }
+
+    func deleteSnapshot(envId: String, snapshotId: String) throws {
+        let bundlePath = "\(bundleStorePath)/\(envId).bundle"
+        let snapshotPath = "\(bundlePath)/snapshots/\(snapshotId)"
+
+        guard FileManager.default.fileExists(atPath: snapshotPath) else {
+            throw VMError.snapshotNotFound(snapshotId)
+        }
+
+        try FileManager.default.removeItem(atPath: snapshotPath)
+        logger.info("snapshot \(snapshotId) deleted for environment \(envId)")
+    }
+
+    func restoreSnapshot(envId: String, snapshotId: String) async throws {
+        guard let running = vms[envId] else {
+            throw VMError.notFound(envId)
+        }
+
+        let bundlePath = "\(bundleStorePath)/\(envId).bundle"
+        let snapshotDisk = "\(bundlePath)/snapshots/\(snapshotId)/disk.img"
+        let diskPath = "\(bundlePath)/disk.img"
+
+        guard FileManager.default.fileExists(atPath: snapshotDisk) else {
+            throw VMError.snapshotNotFound(snapshotId)
+        }
+
+        logger.info("restoring snapshot \(snapshotId) for environment \(envId)")
+
+        // Stop the VM, replace disk, restart
+        try await running.vm.stop()
+
+        try FileManager.default.removeItem(atPath: diskPath)
+        try FileManager.default.copyItem(atPath: snapshotDisk, toPath: diskPath)
+
+        try await running.vm.start()
+        logger.info("snapshot \(snapshotId) restored for environment \(envId)")
+    }
+
+    // MARK: - Migration
+
+    /// Export a VM bundle for migration to another node.
+    /// Pauses and saves the VM state, then returns the bundle path.
+    func exportForMigration(envId: String) async throws -> String {
+        guard let running = vms[envId] else {
+            throw VMError.notFound(envId)
+        }
+
+        logger.info("exporting VM \(envId) for migration")
+
+        // VM should already be suspended/paused
+        if running.vm.state == .running {
+            try await running.vm.pause()
+        }
+
+        // Save VM state to bundle (macOS 14+)
+        let statePath = "\(running.bundlePath)/vm-state.dat"
+        if #available(macOS 14.0, *) {
+            try await running.vm.saveMachineStateTo(url: URL(fileURLWithPath: statePath))
+        }
+
+        try await running.vm.stop()
+        vms.removeValue(forKey: envId)
+
+        logger.info("VM \(envId) exported, bundle at \(running.bundlePath)")
+        return running.bundlePath
+    }
+
+    /// Import a VM bundle that was migrated from another node.
+    func importForMigration(envId: String, cpuCount: Int = 4, memoryGB: Int = 8) async throws {
+        logger.info("importing migrated VM \(envId)")
+
+        // The bundle should already be at the expected path
+        try await createVM(envId: envId, cpuCount: cpuCount, memoryGB: memoryGB)
+
+        // If saved state exists, restore it and the VM will be paused
+        let bundlePath = "\(bundleStorePath)/\(envId).bundle"
+        let statePath = "\(bundlePath)/vm-state.dat"
+        if FileManager.default.fileExists(atPath: statePath),
+           let running = vms[envId] {
+            if #available(macOS 14.0, *) {
+                try await running.vm.restoreMachineStateFrom(url: URL(fileURLWithPath: statePath))
+            }
+            try FileManager.default.removeItem(atPath: statePath)
+            logger.info("VM \(envId) imported with saved state")
+        }
+    }
+
+    // MARK: - Guest provisioning
+
+    /// Write SSH keys to the shared directory for the guest agent to pick up.
+    func provisionSSHKeys(envId: String, username: String, keys: [String]) throws {
+        let bundlePath = "\(bundleStorePath)/\(envId).bundle"
+        let sharedPath = "\(bundlePath)/shared"
+
+        try FileManager.default.createDirectory(atPath: sharedPath, withIntermediateDirectories: true)
+
+        let request = ProvisioningCommand(
+            action: "sync_ssh_keys",
+            username: username,
+            ssh_keys: keys
+        )
+
+        let data = try JSONEncoder().encode(request)
+        let requestPath = "\(sharedPath)/provision-request.json"
+        try data.write(to: URL(fileURLWithPath: requestPath))
+
+        logger.info("wrote SSH key provisioning request for \(username) on env \(envId)")
+    }
+
+    private struct ProvisioningCommand: Encodable {
+        let action: String
+        let username: String?
+        let ssh_keys: [String]?
+    }
+
     func vmState(envId: String) -> VZVirtualMachine.State? {
         return vms[envId]?.vm.state
     }
@@ -224,12 +360,9 @@ final class VMManager {
             return model
         }
 
-        // Use the host's most recent supported hardware model
-        guard let model = VZMacHardwareModel.supportedHardwareModels.first else {
-            throw VMError.noSupportedHardwareModel
-        }
-        try model.dataRepresentation.write(to: URL(fileURLWithPath: path))
-        return model
+        // Hardware model should be created during IPSW restore (IPSWRestore.installMacOS).
+        // If we reach here, the bundle was partially set up without a proper install.
+        throw VMError.noSupportedHardwareModel
     }
 
     private func loadOrCreateMachineIdentifier(bundlePath: String) throws -> VZMacMachineIdentifier {
@@ -253,6 +386,7 @@ enum VMError: Error, CustomStringConvertible {
     case invalidHardwareModel
     case noSupportedHardwareModel
     case invalidMachineIdentifier
+    case snapshotNotFound(String)
 
     var description: String {
         switch self {
@@ -261,6 +395,7 @@ enum VMError: Error, CustomStringConvertible {
         case .invalidHardwareModel: return "invalid hardware model data"
         case .noSupportedHardwareModel: return "no supported macOS hardware model found"
         case .invalidMachineIdentifier: return "invalid machine identifier data"
+        case .snapshotNotFound(let id): return "snapshot not found: \(id)"
         }
     }
 }

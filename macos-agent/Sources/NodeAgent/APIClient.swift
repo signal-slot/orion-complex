@@ -69,6 +69,12 @@ actor APIClient {
         try await deleteRequest("/v1/environments/\(envId)")
     }
 
+    // MARK: - Node heartbeat
+
+    func sendHeartbeat(nodeId: String) async throws {
+        try await postNoContent("/v1/nodes/\(nodeId)/heartbeat", body: EmptyBody())
+    }
+
     // MARK: - SSH keys for provisioning
 
     struct UserSSHKey: Codable {
@@ -80,6 +86,23 @@ actor APIClient {
 
     func listSSHKeys() async throws -> [UserSSHKey] {
         return try await get("/v1/ssh-keys")
+    }
+
+    func listUserSSHKeys(userId: String) async throws -> [UserSSHKey] {
+        return try await get("/v1/users/\(userId)/ssh-keys")
+    }
+
+    // MARK: - Snapshots
+
+    struct Snapshot: Codable {
+        let id: String
+        let env_id: String?
+        let name: String?
+        let created_at: Int64?
+    }
+
+    func listSnapshots(envId: String) async throws -> [Snapshot] {
+        return try await get("/v1/environments/\(envId)/snapshots")
     }
 
     // MARK: - Image info
@@ -96,6 +119,8 @@ actor APIClient {
     func getImage(imageId: String) async throws -> Image {
         return try await get("/v1/images/\(imageId)")
     }
+
+    private struct EmptyBody: Encodable {}
 
     // MARK: - HTTP helpers
 
@@ -135,6 +160,18 @@ actor APIClient {
         let (data, response) = try await session.data(for: request)
         try checkResponse(response, data: data)
         return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func postNoContent<B: Encodable>(_ path: String, body: B) async throws {
+        let url = baseURL.appendingPathComponent(path)
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await session.data(for: request)
+        try checkResponse(response, data: data)
     }
 
     private func deleteRequest(_ path: String) async throws {
