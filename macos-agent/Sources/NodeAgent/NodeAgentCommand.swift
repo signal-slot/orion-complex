@@ -21,6 +21,9 @@ struct NodeAgentCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Path to VM bundle storage")
     var bundleStore: String?
 
+    @Option(name: .long, help: "Existing node ID (skip registration)")
+    var nodeId: String?
+
     @Option(name: .long, help: "Poll interval in seconds")
     var pollInterval: Int?
 
@@ -54,6 +57,7 @@ struct NodeAgentCommand: AsyncParsableCommand {
 
         let vmManager = VMManager(bundleStorePath: effectiveBundleStore)
         let ipswRestore = IPSWRestore(bundleStorePath: effectiveBundleStore)
+        let templateManager = TemplateManager(bundleStorePath: effectiveBundleStore)
 
         // Download IPSW if requested
         if downloadIpsw {
@@ -70,25 +74,31 @@ struct NodeAgentCommand: AsyncParsableCommand {
         let cpuCount = ProcessInfo.processInfo.processorCount
         let memoryBytes = Int64(ProcessInfo.processInfo.physicalMemory)
 
-        // Register this node with the control plane
-        var nodeId: String?
-        logger.info("registering node with control plane...")
-        do {
-            let node = try await api.registerNode(.init(
-                name: effectiveNodeName,
-                host_os: "macos",
-                host_arch: NodeAgentHelpers.currentArch(),
-                cpu_cores: cpuCount,
-                memory_bytes: memoryBytes,
-                disk_bytes_total: NodeAgentHelpers.diskSpace()
-            ))
-            nodeId = node.id
-            logger.info("registered as node \(node.id)")
-        } catch let error as APIError {
-            logger.error("failed to register node: \(error)")
-            logger.info("continuing — node may already be registered")
-        } catch {
-            logger.error("failed to register node: \(error)")
+        // Use existing node ID or register a new one
+        let effectiveNodeId = nodeId ?? config.nodeId
+        var resolvedNodeId: String?
+        if let existingId = effectiveNodeId {
+            resolvedNodeId = existingId
+            logger.info("using existing node ID: \(existingId)")
+        } else {
+            logger.info("registering node with control plane...")
+            do {
+                let node = try await api.registerNode(.init(
+                    name: effectiveNodeName,
+                    host_os: "macos",
+                    host_arch: NodeAgentHelpers.currentArch(),
+                    cpu_cores: cpuCount,
+                    memory_bytes: memoryBytes,
+                    disk_bytes_total: NodeAgentHelpers.diskSpace()
+                ))
+                resolvedNodeId = node.id
+                logger.info("registered as node \(node.id)")
+            } catch let error as APIError {
+                logger.error("failed to register node: \(error)")
+                logger.info("continuing — node may already be registered")
+            } catch {
+                logger.error("failed to register node: \(error)")
+            }
         }
 
         // Main poll loop
@@ -99,7 +109,7 @@ struct NodeAgentCommand: AsyncParsableCommand {
         while !Task.isCancelled {
             // Send heartbeat periodically
             heartbeatCounter += 1
-            if heartbeatCounter >= heartbeatEveryN, let nid = nodeId {
+            if heartbeatCounter >= heartbeatEveryN, let nid = resolvedNodeId {
                 heartbeatCounter = 0
                 do {
                     try await api.sendHeartbeat(nodeId: nid)
@@ -112,7 +122,8 @@ struct NodeAgentCommand: AsyncParsableCommand {
                 api: api,
                 vmManager: vmManager,
                 ipswRestore: ipswRestore,
-                nodeId: nodeId,
+                templateManager: templateManager,
+                nodeId: resolvedNodeId,
                 logger: logger
             )
 

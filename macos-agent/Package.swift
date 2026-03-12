@@ -9,6 +9,8 @@ let package = Package(
     products: [
         .executable(name: "orion-node-agent", targets: ["NodeAgent"]),
         .executable(name: "orion-guest-agent", targets: ["GuestAgent"]),
+        .executable(name: "orion-vm-setup", targets: ["VMSetup"]),
+        .executable(name: "orion-capture-image", targets: ["CaptureImage"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
@@ -29,6 +31,18 @@ let package = Package(
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
+        .executableTarget(
+            name: "VMSetup",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ]
+        ),
+        .executableTarget(
+            name: "CaptureImage",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
     ]

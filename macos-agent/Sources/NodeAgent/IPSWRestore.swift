@@ -1,5 +1,5 @@
 import Foundation
-import Virtualization
+@preconcurrency import Virtualization
 import Logging
 
 /// Handles downloading macOS IPSW restore images and performing initial OS installation.
@@ -163,33 +163,44 @@ final class IPSWRestore {
 
         try config.validate()
 
-        let vm = VZVirtualMachine(configuration: config)
-
-        // Perform the install
+        // VZVirtualMachine and VZMacOSInstaller must be created and used on the main queue.
         logger.info("starting macOS restore from IPSW...")
 
-        let installer = VZMacOSInstaller(virtualMachine: vm, restoringFromImageAt: ipswURL)
-
-        // Observe progress
-        let progressObserver = installer.progress.observe(\.fractionCompleted) { progress, _ in
-            let pct = Int(progress.fractionCompleted * 100)
-            if pct % 10 == 0 {
-                print("  install progress: \(pct)%")
-            }
+        let vm = try await MainActor.run {
+            VZVirtualMachine(configuration: config)
         }
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            installer.install { result in
-                switch result {
-                case .success:
-                    continuation.resume()
-                case .failure(let error):
-                    continuation.resume(throwing: error)
+            DispatchQueue.main.async {
+                let installer = VZMacOSInstaller(virtualMachine: vm, restoringFromImageAt: ipswURL)
+
+                let progressObserver = installer.progress.observe(\.fractionCompleted) { progress, _ in
+                    let pct = Int(progress.fractionCompleted * 100)
+                    if pct % 10 == 0 {
+                        print("  install progress: \(pct)%")
+                    }
+                }
+
+                installer.install { result in
+                    progressObserver.invalidate()
+                    // Stop the install VM to release file locks before returning
+                    if vm.canRequestStop {
+                        try? vm.requestStop()
+                    }
+                    vm.stop { _ in
+                        switch result {
+                        case .success:
+                            continuation.resume()
+                        case .failure(let error):
+                            continuation.resume(throwing: error)
+                        }
+                    }
                 }
             }
         }
 
-        progressObserver.invalidate()
+        // Brief pause to ensure file handles are released
+        try await Task.sleep(nanoseconds: 1_000_000_000)
 
         logger.info("macOS installation completed successfully")
 

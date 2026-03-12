@@ -1,5 +1,5 @@
 import Foundation
-import Virtualization
+@preconcurrency import Virtualization
 import Logging
 
 /// Manages macOS guest VMs using Apple's Virtualization.framework.
@@ -125,9 +125,12 @@ final class VMManager {
 
         try config.validate()
 
-        let vm = VZVirtualMachine(configuration: config)
+        // VZVirtualMachine must be created and used on the main queue
+        let vm = await MainActor.run {
+            VZVirtualMachine(configuration: config)
+        }
 
-        try await vm.start()
+        try await startVMOnMain(vm)
         logger.info("macOS VM started for environment \(envId)")
 
         vms[envId] = RunningVM(vm: vm, bundlePath: bundlePath)
@@ -142,12 +145,11 @@ final class VMManager {
 
         if running.vm.canRequestStop {
             try running.vm.requestStop()
-            // Wait briefly for graceful shutdown
             try await Task.sleep(nanoseconds: 5_000_000_000)
         }
 
         if running.vm.state != .stopped {
-            try await running.vm.stop()
+            try await stopVMOnMain(running.vm)
         }
 
         // Remove the bundle directory
@@ -161,7 +163,7 @@ final class VMManager {
         }
 
         logger.info("suspending macOS VM for environment \(envId)")
-        try await running.vm.pause()
+        try await pauseVMOnMain(running.vm)
     }
 
     func resumeVM(envId: String) async throws {
@@ -170,7 +172,7 @@ final class VMManager {
         }
 
         logger.info("resuming macOS VM for environment \(envId)")
-        try await running.vm.resume()
+        try await resumeVMOnMain(running.vm)
     }
 
     func rebootVM(envId: String, force: Bool) async throws {
@@ -180,15 +182,14 @@ final class VMManager {
 
         if force {
             logger.info("force rebooting macOS VM for environment \(envId)")
-            try await running.vm.stop()
-            try await running.vm.start()
+            try await stopVMOnMain(running.vm)
+            try await startVMOnMain(running.vm)
         } else {
             logger.info("rebooting macOS VM for environment \(envId)")
             if running.vm.canRequestStop {
                 try running.vm.requestStop()
-                // Wait for shutdown, then restart
                 try await Task.sleep(nanoseconds: 10_000_000_000)
-                try await running.vm.start()
+                try await startVMOnMain(running.vm)
             }
         }
     }
@@ -243,12 +244,12 @@ final class VMManager {
         logger.info("restoring snapshot \(snapshotId) for environment \(envId)")
 
         // Stop the VM, replace disk, restart
-        try await running.vm.stop()
+        try await stopVMOnMain(running.vm)
 
         try FileManager.default.removeItem(atPath: diskPath)
         try FileManager.default.copyItem(atPath: snapshotDisk, toPath: diskPath)
 
-        try await running.vm.start()
+        try await startVMOnMain(running.vm)
         logger.info("snapshot \(snapshotId) restored for environment \(envId)")
     }
 
@@ -265,7 +266,7 @@ final class VMManager {
 
         // VM should already be suspended/paused
         if running.vm.state == .running {
-            try await running.vm.pause()
+            try await pauseVMOnMain(running.vm)
         }
 
         // Save VM state to bundle (macOS 14+)
@@ -274,7 +275,7 @@ final class VMManager {
             try await running.vm.saveMachineStateTo(url: URL(fileURLWithPath: statePath))
         }
 
-        try await running.vm.stop()
+        try await stopVMOnMain(running.vm)
         vms.removeValue(forKey: envId)
 
         logger.info("VM \(envId) exported, bundle at \(running.bundlePath)")
@@ -335,6 +336,67 @@ final class VMManager {
 
     func activeVMCount() -> Int {
         return vms.count
+    }
+
+    // MARK: - Main queue helpers for Virtualization.framework
+
+    private func startVMOnMain(_ vm: VZVirtualMachine) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.main.async {
+                vm.start { result in
+                    switch result {
+                    case .success:
+                        continuation.resume()
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopVMOnMain(_ vm: VZVirtualMachine) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.main.async {
+                vm.stop { error in
+                    if let error = error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+        }
+    }
+
+    private func pauseVMOnMain(_ vm: VZVirtualMachine) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.main.async {
+                vm.pause { result in
+                    switch result {
+                    case .success:
+                        continuation.resume()
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+
+    private func resumeVMOnMain(_ vm: VZVirtualMachine) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.main.async {
+                vm.resume { result in
+                    switch result {
+                    case .success:
+                        continuation.resume()
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Helpers

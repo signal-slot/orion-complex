@@ -6,6 +6,7 @@ enum NodeAgentHelpers {
         api: APIClient,
         vmManager: VMManager,
         ipswRestore: IPSWRestore,
+        templateManager: TemplateManager,
         nodeId: String?,
         logger: Logger
     ) async {
@@ -26,16 +27,37 @@ enum NodeAgentHelpers {
                     do {
                         let bundlePath = vmManager.bundlePath(envId: env.id)
 
-                        // If not installed yet, perform IPSW restore first
+                        // If not installed yet, try golden image clone, then fall back to IPSW restore
                         if !ipswRestore.isInstalled(bundlePath: bundlePath) {
-                            logger.info("[\(env.id)] no OS installed, performing IPSW restore...")
-                            let (ipswURL, restoreImage) = try await ipswRestore.downloadLatestIPSW()
-                            try await ipswRestore.installMacOS(
+                            if let imageId = env.image_id, templateManager.hasTemplate(imageId: imageId) {
+                                logger.info("[\(env.id)] cloning from golden image \(imageId)")
+                                try templateManager.cloneTemplate(imageId: imageId, toBundlePath: bundlePath)
+                                logger.info("[\(env.id)] golden image cloned")
+                            } else {
+                                logger.info("[\(env.id)] no template available, performing IPSW restore...")
+                                let (ipswURL, restoreImage) = try await ipswRestore.downloadLatestIPSW()
+                                try await ipswRestore.installMacOS(
+                                    bundlePath: bundlePath,
+                                    ipswURL: ipswURL,
+                                    restoreImage: restoreImage
+                                )
+                                logger.info("[\(env.id)] macOS installed successfully")
+                            }
+
+                            // Provision SSH keys and hostname on the disk before first boot
+                            var sshKeys: [String] = []
+                            if let ownerId = env.owner_user_id {
+                                let keys = try await api.listUserSSHKeys(userId: ownerId)
+                                sshKeys = keys.compactMap(\.public_key)
+                            }
+                            let shortId = String(env.id.prefix(8))
+                            let hostname = "orion-\(shortId)"
+                            logger.info("[\(env.id)] provisioning disk: \(sshKeys.count) SSH key(s), hostname=\(hostname)")
+                            try templateManager.provisionDisk(
                                 bundlePath: bundlePath,
-                                ipswURL: ipswURL,
-                                restoreImage: restoreImage
+                                authorizedKeys: sshKeys,
+                                hostname: hostname
                             )
-                            logger.info("[\(env.id)] macOS installed successfully")
                         }
 
                         try await vmManager.createVM(envId: env.id)
