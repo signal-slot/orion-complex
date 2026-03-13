@@ -93,6 +93,29 @@ final class TemplateManager {
         logger.info("cloned Linux template \(imageId) to \(bundlePath)")
     }
 
+    /// Clone a QEMU (x86-64) image template into a new VM bundle directory.
+    /// Copies the qcow2 disk without creating VZ-specific files.
+    func cloneQEMUTemplate(imageId: String, toBundlePath bundlePath: String) throws {
+        let templatePath = "\(imagesPath)/\(imageId)"
+        let fm = FileManager.default
+
+        try fm.createDirectory(atPath: bundlePath, withIntermediateDirectories: true)
+
+        // Copy disk image (qcow2 format)
+        try fm.copyItem(atPath: "\(templatePath)/disk.img", toPath: "\(bundlePath)/disk.img")
+
+        // Create shared directory
+        try fm.createDirectory(
+            atPath: "\(bundlePath)/shared",
+            withIntermediateDirectories: true
+        )
+
+        // Mark as installed
+        fm.createFile(atPath: "\(bundlePath)/installed", contents: nil)
+
+        logger.info("cloned QEMU template \(imageId) to \(bundlePath)")
+    }
+
     /// Provision a cloned VM disk with SSH authorized_keys and hostname.
     /// Mounts the disk image, writes keys, sets hostname, then unmounts.
     func provisionDisk(bundlePath: String, authorizedKeys: [String], hostname: String?) throws {

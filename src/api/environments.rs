@@ -198,11 +198,13 @@ async fn create_environment(
                 "linux"
             };
             let guest_arch = image.guest_arch.as_deref().unwrap_or("x86_64");
+            let is_agent: i32 = if is_agent_managed(provider) { 1 } else { 0 };
             sqlx::query_as::<_, crate::models::Node>(
                 "SELECT n.* FROM nodes n
                  WHERE n.online = 1
                    AND n.host_os = ?
-                   AND (n.host_arch = ? OR (n.host_arch IN ('arm64', 'aarch64') AND ? IN ('arm64', 'aarch64')))
+                   AND (n.host_arch = ? OR (n.host_arch IN ('arm64', 'aarch64') AND ? IN ('arm64', 'aarch64'))
+                        OR (? = 1 AND n.host_arch IN ('arm64', 'aarch64') AND ? = 'x86_64'))
                    AND (SELECT COUNT(*) FROM environments e
                         WHERE e.node_id = n.id AND e.state IN ('creating', 'running', 'suspending', 'resuming', 'rebooting'))
                        < COALESCE(n.max_running_envs, 9999)
@@ -219,6 +221,8 @@ async fn create_environment(
             )
             .bind(host_os_filter)
             .bind(guest_arch)
+            .bind(guest_arch)
+            .bind(is_agent)
             .bind(guest_arch)
             .bind(vcpus)
             .bind(memory_bytes)

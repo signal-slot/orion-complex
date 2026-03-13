@@ -25,16 +25,23 @@ enum NodeAgentHelpers {
                     guard vmManager.vmState(envId: env.id) == nil else { continue }
 
                     let guestOS = env.guest_os ?? "macos"
-                    logger.info("[\(env.id)] creating \(guestOS) VM")
+                    let guestArch = env.guest_arch ?? "arm64"
+                    let isQEMU = guestArch == "x86_64"
+                    logger.info("[\(env.id)] creating \(guestOS) VM (arch: \(guestArch)\(isQEMU ? ", QEMU" : ""))")
                     do {
                         let bundlePath = vmManager.bundlePath(envId: env.id)
 
                         if guestOS == "linux" {
                             // Linux guest: clone from a pre-registered template (cloud image)
                             if let imageId = env.image_id, templateManager.hasTemplate(imageId: imageId, guestOS: "linux") {
-                                logger.info("[\(env.id)] cloning Linux template \(imageId)")
-                                try templateManager.cloneLinuxTemplate(imageId: imageId, toBundlePath: bundlePath)
-                                logger.info("[\(env.id)] Linux template cloned")
+                                if isQEMU {
+                                    logger.info("[\(env.id)] cloning QEMU template \(imageId)")
+                                    try templateManager.cloneQEMUTemplate(imageId: imageId, toBundlePath: bundlePath)
+                                } else {
+                                    logger.info("[\(env.id)] cloning Linux template \(imageId)")
+                                    try templateManager.cloneLinuxTemplate(imageId: imageId, toBundlePath: bundlePath)
+                                }
+                                logger.info("[\(env.id)] template cloned")
                             } else {
                                 let imageDesc = env.image_id ?? "nil"
                                 logger.error("[\(env.id)] no template for Linux image \(imageDesc) — Linux images must be pre-registered")
@@ -99,7 +106,7 @@ enum NodeAgentHelpers {
 
                             logger.info("[\(env.id)] cloud-init seed written: \(sshKeys.count) SSH key(s), hostname=\(hostname)")
 
-                            try await vmManager.createVM(envId: env.id, guestOS: "linux")
+                            try await vmManager.createVM(envId: env.id, guestOS: "linux", guestArch: guestArch)
                         } else {
                             // macOS guest: IPSW restore or golden image clone
                             if !ipswRestore.isInstalled(bundlePath: bundlePath) {
@@ -140,8 +147,16 @@ enum NodeAgentHelpers {
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM running")
 
-                        // Set up port forwarding if enabled
-                        if env.port_forwarding == 1 {
+                        // For QEMU VMs, always report the SSH endpoint (QEMU handles its own forwarding)
+                        if isQEMU, let sshPort = vmManager.qemuSSHPort(envId: env.id) {
+                            let hostIP = PortForwarder.hostLANIP() ?? "127.0.0.1"
+                            let _ = try? await api.updateEndpoints(
+                                envId: env.id,
+                                endpoints: .init(ssh_host: hostIP, ssh_port: sshPort, vnc_host: nil, vnc_port: nil)
+                            )
+                            logger.info("[\(env.id)] QEMU SSH endpoint: \(hostIP):\(sshPort)")
+                        } else if env.port_forwarding == 1 {
+                            // Set up port forwarding if enabled (VZ VMs)
                             await setupPortForwarding(
                                 envId: env.id,
                                 vmManager: vmManager,
