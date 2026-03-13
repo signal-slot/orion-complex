@@ -158,6 +158,38 @@ export async function webauthnLoginComplete(body: {
   });
 }
 
+// ── TOTP (fallback) ──────────────────────────────────────────────
+
+export async function totpRegister(body: {
+  email: string;
+  display_name?: string;
+}): Promise<{ challenge_id: string; otpauth_url: string; secret: string }> {
+  return request("/v1/auth/totp/register", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function totpVerify(body: {
+  challenge_id: string;
+  code: string;
+}): Promise<LoginResponse> {
+  return request("/v1/auth/totp/verify", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function totpLogin(body: {
+  email: string;
+  code: string;
+}): Promise<LoginResponse> {
+  return request("/v1/auth/totp/login", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 // ── Users (admin) ──────────────────────────────────────────────────
 
 export async function listUsers(params?: PaginationParams): Promise<User[]> {
@@ -455,6 +487,9 @@ export const api = {
   webauthnRegisterComplete,
   webauthnLoginBegin,
   webauthnLoginComplete,
+  totpRegister,
+  totpVerify,
+  totpLogin,
   listUsers,
   getUser,
   updateUserRole,

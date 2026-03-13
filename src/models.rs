@@ -10,6 +10,8 @@ pub struct User {
     pub display_name: Option<String>,
     pub role: Option<String>,
     pub disabled: i64,
+    #[serde(skip_serializing)]
+    pub totp_secret: Option<String>,
     pub created_at: Option<i64>,
 }
 

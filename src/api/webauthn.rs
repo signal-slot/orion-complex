@@ -19,6 +19,9 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/auth/webauthn/login/begin", post(login_begin))
         .route("/v1/auth/webauthn/login/complete", post(login_complete))
+        .route("/v1/auth/totp/register", post(totp_register))
+        .route("/v1/auth/totp/verify", post(totp_verify))
+        .route("/v1/auth/totp/login", post(totp_login))
 }
 
 // ── Registration ────────────────────────────────────────────────────
@@ -353,6 +356,242 @@ async fn login_complete(
     }
 
     // Issue session token
+    let token = create_session_token(&state.auth_config, &user.id)
+        .map_err(|e| AppError::Internal(format!("token error: {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "user": user,
+    })))
+}
+
+// ── TOTP (fallback for non-WebAuthn browsers) ─────────────────────
+
+#[derive(Debug, Deserialize)]
+struct TotpRegisterRequest {
+    email: String,
+    display_name: Option<String>,
+}
+
+async fn totp_register(
+    State(state): State<AppState>,
+    Json(req): Json<TotpRegisterRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let email = req.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return Err(AppError::BadRequest("invalid email".into()));
+    }
+
+    // Check allowed domains
+    let email_domain = email.split('@').nth(1).unwrap_or("").to_string();
+    if !state.auth_config.allowed_domains.is_empty()
+        && !state.auth_config.allowed_domains.contains(&email_domain)
+    {
+        return Err(AppError::BadRequest(format!(
+            "domain '{email_domain}' is not allowed"
+        )));
+    }
+
+    // Check if user already has TOTP set up
+    let existing = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = ?")
+        .bind(&email)
+        .fetch_optional(&state.db)
+        .await?;
+
+    if let Some(ref user) = existing {
+        if user.totp_secret.is_some() {
+            return Err(AppError::BadRequest(
+                "account already exists — use login instead".into(),
+            ));
+        }
+    }
+
+    // Generate TOTP secret
+    let secret = totp_rs::Secret::generate_secret();
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.to_bytes().map_err(|e| AppError::Internal(format!("secret error: {e}")))?,
+        Some("Orion Complex".to_string()),
+        email.clone(),
+    )
+    .map_err(|e| AppError::Internal(format!("totp error: {e}")))?;
+
+    let otpauth_url = totp.get_url();
+    let secret_base32 = secret.to_encoded().to_string();
+
+    // Store pending registration in challenges table
+    let challenge_id = uuid::Uuid::new_v4().to_string();
+    let now = crate::unix_now();
+
+    sqlx::query(
+        "INSERT INTO webauthn_challenges (id, challenge_type, state_json, user_id, email, display_name, created_at, expires_at)
+         VALUES (?, 'totp_register', ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&challenge_id)
+    .bind(&secret_base32)
+    .bind(existing.as_ref().map(|u| &u.id))
+    .bind(&email)
+    .bind(req.display_name.as_deref().unwrap_or(""))
+    .bind(now)
+    .bind(now + 600) // 10 minutes to scan QR
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "challenge_id": challenge_id,
+        "otpauth_url": otpauth_url,
+        "secret": secret_base32,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct TotpVerifyRequest {
+    challenge_id: String,
+    code: String,
+}
+
+async fn totp_verify(
+    State(state): State<AppState>,
+    Json(req): Json<TotpVerifyRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let now = crate::unix_now();
+
+    let challenge = sqlx::query_as::<_, crate::models::WebauthnChallenge>(
+        "SELECT * FROM webauthn_challenges WHERE id = ? AND challenge_type = 'totp_register' AND expires_at > ?",
+    )
+    .bind(&req.challenge_id)
+    .bind(now)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::BadRequest("invalid or expired registration".into()))?;
+
+    let secret_base32 = &challenge.state_json;
+    let email = challenge.email.as_deref().unwrap_or("");
+
+    // Verify the code
+    let secret = totp_rs::Secret::Encoded(secret_base32.clone());
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.to_bytes().map_err(|e| AppError::Internal(format!("secret error: {e}")))?,
+        Some("Orion Complex".to_string()),
+        email.to_string(),
+    )
+    .map_err(|e| AppError::Internal(format!("totp error: {e}")))?;
+
+    if !totp.check_current(&req.code).map_err(|e| AppError::Internal(format!("time error: {e}")))? {
+        return Err(AppError::BadRequest("incorrect code — try again".into()));
+    }
+
+    // Delete challenge
+    sqlx::query("DELETE FROM webauthn_challenges WHERE id = ?")
+        .bind(&req.challenge_id)
+        .execute(&state.db)
+        .await?;
+
+    // Get or create user, store TOTP secret
+    let user = if let Some(user_id) = &challenge.user_id {
+        sqlx::query("UPDATE users SET totp_secret = ? WHERE id = ?")
+            .bind(secret_base32)
+            .bind(user_id)
+            .execute(&state.db)
+            .await?;
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await?
+    } else {
+        let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+            .fetch_one(&state.db)
+            .await?;
+        let role = if user_count.0 == 0 { "admin" } else { "user" };
+
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let email_domain = email.split('@').nth(1).unwrap_or("");
+        let display_name = challenge.display_name.as_deref().unwrap_or("");
+
+        sqlx::query(
+            "INSERT INTO users (id, provider, provider_subject, email, email_domain, display_name, role, disabled, totp_secret, created_at)
+             VALUES (?, 'totp', ?, ?, ?, ?, ?, 0, ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(&user_id)
+        .bind(email)
+        .bind(email_domain)
+        .bind(display_name)
+        .bind(role)
+        .bind(secret_base32)
+        .bind(now)
+        .execute(&state.db)
+        .await?;
+
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+            .bind(&user_id)
+            .fetch_one(&state.db)
+            .await?
+    };
+
+    if user.disabled != 0 {
+        return Err(AppError::BadRequest("user is disabled".into()));
+    }
+
+    let token = create_session_token(&state.auth_config, &user.id)
+        .map_err(|e| AppError::Internal(format!("token error: {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "user": user,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct TotpLoginRequest {
+    email: String,
+    code: String,
+}
+
+async fn totp_login(
+    State(state): State<AppState>,
+    Json(req): Json<TotpLoginRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let email = req.email.trim().to_lowercase();
+
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = ?")
+        .bind(&email)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("no account found for this email".into()))?;
+
+    if user.disabled != 0 {
+        return Err(AppError::BadRequest("user is disabled".into()));
+    }
+
+    let secret_base32 = user
+        .totp_secret
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("no TOTP configured for this account".into()))?;
+
+    let secret = totp_rs::Secret::Encoded(secret_base32.to_string());
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.to_bytes().map_err(|e| AppError::Internal(format!("secret error: {e}")))?,
+        Some("Orion Complex".to_string()),
+        email.clone(),
+    )
+    .map_err(|e| AppError::Internal(format!("totp error: {e}")))?;
+
+    if !totp.check_current(&req.code).map_err(|e| AppError::Internal(format!("time error: {e}")))? {
+        return Err(AppError::BadRequest("incorrect code".into()));
+    }
+
     let token = create_session_token(&state.auth_config, &user.id)
         .map_err(|e| AppError::Internal(format!("token error: {e}")))?;
 
