@@ -1,1 +1,10 @@
 /target
+*.db
+
+# Swift
+macos-agent/.build/
+macos-agent/Package.resolved
+
+# Next.js
+web/.next/
+web/node_modules/
