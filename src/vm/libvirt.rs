@@ -93,6 +93,7 @@ fn generate_domain_xml(
     vcpus: i64,
     memory_bytes: i64,
     disk_path: &Path,
+    seed_iso_path: Option<&Path>,
     arch: &str,
 ) -> String {
     let memory_kib = memory_bytes / 1024;
@@ -101,15 +102,70 @@ fn generate_domain_xml(
         _ => "x86_64",
     };
 
+    let cdrom_xml = seed_iso_path
+        .map(|p| {
+            format!(
+                r#"
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{}'/>
+      <target dev='hdc' bus='scsi'/>
+      <readonly/>
+    </disk>
+    <controller type='scsi' model='virtio-scsi'/>"#,
+                p.display()
+            )
+        })
+        .unwrap_or_default();
+
+    // Use OVMF for UEFI boot if available
+    let ovmf_paths = [
+        "/usr/share/edk2-ovmf/OVMF_CODE.fd",
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+    ];
+    let ovmf_code = ovmf_paths.iter().find(|p| std::path::Path::new(p).exists());
+
+    // SMBIOS hint for cloud-init NoCloud datasource detection via qemu:commandline
+    let qemu_ns_xml = if seed_iso_path.is_some() {
+        r#"
+  <qemu:commandline>
+    <qemu:arg value='-smbios'/>
+    <qemu:arg value='type=1,serial=ds=nocloud'/>
+  </qemu:commandline>"#
+    } else {
+        ""
+    };
+
+    let domain_attrs = if seed_iso_path.is_some() {
+        "type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'"
+    } else {
+        "type='kvm'"
+    };
+
+    let os_xml = if let Some(fw) = ovmf_code {
+        format!(
+            r#"<os>
+    <type arch='{arch_str}' machine='q35'>hvm</type>
+    <loader readonly='yes' type='pflash'>{fw}</loader>
+    <boot dev='hd'/>
+  </os>"#
+        )
+    } else {
+        format!(
+            r#"<os>
+    <type arch='{arch_str}'>hvm</type>
+    <boot dev='hd'/>
+  </os>"#
+        )
+    };
+
     format!(
-        r#"<domain type='kvm'>
+        r#"<domain {domain_attrs}>
   <name>{name}</name>
   <memory unit='KiB'>{memory_kib}</memory>
   <vcpu>{vcpus}</vcpu>
-  <os>
-    <type arch='{arch_str}'>hvm</type>
-    <boot dev='hd'/>
-  </os>
+  {os_xml}
   <features>
     <acpi/>
     <apic/>
@@ -119,7 +175,7 @@ fn generate_domain_xml(
       <driver name='qemu' type='qcow2' discard='unmap'/>
       <source file='{disk_path}'/>
       <target dev='vda' bus='virtio'/>
-    </disk>
+    </disk>{cdrom_xml}
     <interface type='network'>
       <source network='default'/>
       <model type='virtio'/>
@@ -138,13 +194,16 @@ fn generate_domain_xml(
     <rng model='virtio'>
       <backend model='random'>/dev/urandom</backend>
     </rng>
-  </devices>
+  </devices>{qemu_ns_xml}
 </domain>"#,
+        domain_attrs = domain_attrs,
         name = name,
         memory_kib = memory_kib,
         vcpus = vcpus,
-        arch_str = arch_str,
+        os_xml = os_xml,
         disk_path = disk_path.display(),
+        cdrom_xml = cdrom_xml,
+        qemu_ns_xml = qemu_ns_xml,
     )
 }
 
@@ -194,6 +253,84 @@ async fn wait_for_ip(uri: &str, domain: &str, retries: u32) -> Option<String> {
         }
     }
     None
+}
+
+async fn create_cloud_init_seed(
+    env_dir: &Path,
+    env_id: &str,
+    ssh_authorized_keys: &[String],
+) -> Result<PathBuf, String> {
+    let seed_dir = env_dir.join("seed");
+    tokio::fs::create_dir_all(&seed_dir)
+        .await
+        .map_err(|e| format!("failed to create seed dir: {e}"))?;
+
+    let meta_data = format!(
+        "instance-id: {env_id}\nlocal-hostname: orion\n"
+    );
+
+    let ssh_keys_yaml = if ssh_authorized_keys.is_empty() {
+        String::new()
+    } else {
+        let keys: Vec<String> = ssh_authorized_keys
+            .iter()
+            .map(|k| format!("  - {k}"))
+            .collect();
+        format!("ssh_authorized_keys:\n{}\n", keys.join("\n"))
+    };
+
+    let user_data = format!(
+        r#"#cloud-config
+password: orion
+chpasswd:
+  expire: false
+ssh_pwauth: true
+{ssh_keys_yaml}"#
+    );
+
+    // NoCloud network-config v2: enable DHCP on all ethernets
+    let network_config = r#"version: 2
+ethernets:
+  nics:
+    match:
+      name: "e*"
+    dhcp4: true
+"#;
+
+    tokio::fs::write(seed_dir.join("meta-data"), &meta_data)
+        .await
+        .map_err(|e| format!("failed to write meta-data: {e}"))?;
+    tokio::fs::write(seed_dir.join("user-data"), &user_data)
+        .await
+        .map_err(|e| format!("failed to write user-data: {e}"))?;
+    tokio::fs::write(seed_dir.join("network-config"), network_config)
+        .await
+        .map_err(|e| format!("failed to write network-config: {e}"))?;
+
+    let iso_path = env_dir.join("seed.iso");
+    let iso_str = iso_path.to_string_lossy().to_string();
+    let seed_str = seed_dir.to_string_lossy().to_string();
+
+    let output = Command::new("mkisofs")
+        .args([
+            "-output", &iso_str,
+            "-volid", "cidata",
+            "-joliet",
+            "-rock",
+            &format!("{}/meta-data", seed_str),
+            &format!("{}/user-data", seed_str),
+            &format!("{}/network-config", seed_str),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run mkisofs: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("mkisofs failed: {}", stderr.trim()));
+    }
+
+    Ok(iso_path)
 }
 
 // ── VmProvider implementation ───────────────────────────────────────
@@ -249,6 +386,15 @@ impl VmProvider for LibvirtProvider {
                 tracing::info!(env_id = %params.env_id, size = %size_str, "created empty disk");
             }
 
+            // Generate cloud-init seed ISO
+            let seed_iso = create_cloud_init_seed(
+                &env_dir,
+                &params.env_id,
+                &params.ssh_authorized_keys,
+            )
+            .await
+            .ok();
+
             // Generate and write domain XML
             let dom_name = format!("orion-{}", params.env_id);
             let xml = generate_domain_xml(
@@ -256,6 +402,7 @@ impl VmProvider for LibvirtProvider {
                 params.vcpus,
                 params.memory_bytes,
                 &disk_path,
+                seed_iso.as_deref(),
                 &params.guest_arch,
             );
 
@@ -312,8 +459,8 @@ impl VmProvider for LibvirtProvider {
             // Force stop (ignore errors — domain might already be stopped)
             let _ = virsh(&uri, &["destroy", &dom_name]).await;
 
-            // Undefine, removing any managed snapshots
-            let _ = virsh(&uri, &["undefine", &dom_name, "--snapshots-metadata"]).await;
+            // Undefine, removing snapshots and NVRAM
+            let _ = virsh(&uri, &["undefine", &dom_name, "--snapshots-metadata", "--nvram"]).await;
 
             // Remove disk and metadata
             if env_dir.exists() {
@@ -550,6 +697,7 @@ mod tests {
             4,
             8 * 1024 * 1024 * 1024, // 8 GB
             Path::new("/data/test/disk.qcow2"),
+            None,
             "x86_64",
         );
         assert!(xml.contains("<name>orion-test</name>"));

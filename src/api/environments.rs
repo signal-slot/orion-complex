@@ -259,6 +259,18 @@ async fn create_environment(
     // Only dispatch in-process for libvirt provider.
     // macOS environments stay in "creating" state until the node agent picks them up.
     if !is_agent_managed(provider) {
+        // Fetch user's SSH keys for injection into the VM
+        let ssh_keys: Vec<String> = sqlx::query_as::<_, crate::models::UserSshKey>(
+            "SELECT * FROM user_ssh_keys WHERE user_id = ?",
+        )
+        .bind(&user.0.id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|k| k.public_key)
+        .collect();
+
         let task_id = tasks::create_task_for_env(&state.db, &format!("create_env:{id}"), Some(&id))
             .await
             .map_err(|e| AppError::Internal(format!("failed to create task: {e}")))?;
@@ -278,6 +290,7 @@ async fn create_environment(
                 vcpus,
                 memory_bytes,
                 disk_bytes,
+                ssh_authorized_keys: ssh_keys,
             };
 
             match vm_provider.create_vm(params).await {
@@ -444,6 +457,8 @@ async fn ssh_endpoint(
         "env_id": env.id,
         "host": info.ssh_host,
         "port": info.ssh_port,
+        "username": "ubuntu",
+        "password": "orion",
     })))
 }
 
@@ -473,6 +488,8 @@ async fn vnc_endpoint(
         "env_id": env.id,
         "host": info.vnc_host,
         "port": info.vnc_port,
+        "username": "ubuntu",
+        "password": "orion",
     })))
 }
 

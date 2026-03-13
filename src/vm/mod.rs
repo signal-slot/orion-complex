@@ -25,6 +25,8 @@ pub struct VmCreateParams {
     pub vcpus: i64,
     pub memory_bytes: i64,
     pub disk_bytes: i64,
+    /// SSH public keys to inject via cloud-init
+    pub ssh_authorized_keys: Vec<String>,
 }
 
 /// Trait for VM provider backends (libvirt, QEMU direct, etc.)

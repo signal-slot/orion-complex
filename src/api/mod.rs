@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod dashboard;
 pub mod environments;
 pub mod events;
 pub mod health;
@@ -18,6 +19,7 @@ use crate::models::Environment;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(dashboard::routes())
         .merge(health::routes())
         .merge(auth::routes())
         .merge(users::routes())
