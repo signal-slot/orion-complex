@@ -182,20 +182,46 @@ export default function EnvironmentDetailPage() {
         </dl>
       </div>
 
-      {/* SSH Section */}
-      {state === "running" && sshEndpoint && (
+      {/* Access Section */}
+      {state === "running" && (
         <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-6">
-          <h2 className="text-sm font-medium text-zinc-400 mb-3">SSH Access</h2>
-          <div className="flex items-center gap-3">
-            <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-green-400 font-mono">
-              ssh root@{sshEndpoint.host} -p {sshEndpoint.port}
-            </code>
-            <button
-              onClick={() => navigator.clipboard.writeText(`ssh root@${sshEndpoint.host} -p ${sshEndpoint.port}`)}
-              className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
-            >
-              Copy
-            </button>
+          <h2 className="text-sm font-medium text-zinc-400 mb-3">Access</h2>
+          <div className="space-y-3">
+            {sshEndpoint && (() => {
+              const vmHost = `orion-${env.id.slice(0, 8)}.local`;
+              return (
+                <div>
+                  <p className="text-xs text-zinc-500 mb-1.5">SSH</p>
+                  <div className="flex items-center gap-3">
+                    <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-green-400 font-mono">
+                      ssh root@{vmHost}
+                    </code>
+                    <button
+                      onClick={() => navigator.clipboard.writeText(`ssh root@${vmHost}`)}
+                      className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+            {env.guest_os === "macos" && (
+              <div>
+                <p className="text-xs text-zinc-500 mb-1.5">Screen Sharing (VNC)</p>
+                <div className="flex items-center gap-3">
+                  <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-blue-400 font-mono">
+                    vnc://orion-{env.id.slice(0, 8)}.local
+                  </code>
+                  <button
+                    onClick={() => navigator.clipboard.writeText(`vnc://orion-${env.id.slice(0, 8)}.local`)}
+                    className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

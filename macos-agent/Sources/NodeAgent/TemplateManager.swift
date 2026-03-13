@@ -11,13 +11,21 @@ final class TemplateManager {
         self.imagesPath = "\(bundleStorePath)/images"
     }
 
-    /// Check if a local golden image template exists for the given image ID.
+    /// Check if a local golden image template exists for the given image ID (defaults to macOS).
     func hasTemplate(imageId: String) -> Bool {
+        return hasTemplate(imageId: imageId, guestOS: "macos")
+    }
+
+    /// Check if a local golden image template exists for the given image ID and guest OS.
+    func hasTemplate(imageId: String, guestOS: String) -> Bool {
         let templatePath = "\(imagesPath)/\(imageId)"
         let fm = FileManager.default
-        return fm.fileExists(atPath: "\(templatePath)/disk.img")
-            && fm.fileExists(atPath: "\(templatePath)/hardware-model.dat")
-            && fm.fileExists(atPath: "\(templatePath)/aux-storage")
+        guard fm.fileExists(atPath: "\(templatePath)/disk.img") else { return false }
+        if guestOS == "macos" {
+            return fm.fileExists(atPath: "\(templatePath)/hardware-model.dat")
+                && fm.fileExists(atPath: "\(templatePath)/aux-storage")
+        }
+        return true
     }
 
     /// Clone a golden image template into a new VM bundle directory.
@@ -56,6 +64,33 @@ final class TemplateManager {
         fm.createFile(atPath: "\(bundlePath)/installed", contents: nil)
 
         logger.info("cloned template \(imageId) to \(bundlePath)")
+    }
+
+    /// Clone a Linux golden image template into a new VM bundle directory.
+    /// Creates a fresh EFI variable store instead of copying macOS-specific files.
+    func cloneLinuxTemplate(imageId: String, toBundlePath bundlePath: String) throws {
+        let templatePath = "\(imagesPath)/\(imageId)"
+        let fm = FileManager.default
+
+        try fm.createDirectory(atPath: bundlePath, withIntermediateDirectories: true)
+
+        // Copy disk image (APFS uses clonefile — nearly instant for sparse files)
+        try fm.copyItem(atPath: "\(templatePath)/disk.img", toPath: "\(bundlePath)/disk.img")
+
+        // Create shared directory
+        try fm.createDirectory(
+            atPath: "\(bundlePath)/shared",
+            withIntermediateDirectories: true
+        )
+
+        // Create a fresh EFI variable store
+        let efiPath = "\(bundlePath)/efi-variable-store"
+        let _ = try VZEFIVariableStore(creatingVariableStoreAt: URL(fileURLWithPath: efiPath))
+
+        // Mark as installed so PollCycle skips restore
+        fm.createFile(atPath: "\(bundlePath)/installed", contents: nil)
+
+        logger.info("cloned Linux template \(imageId) to \(bundlePath)")
     }
 
     /// Provision a cloned VM disk with SSH authorized_keys and hostname.
@@ -217,36 +252,45 @@ final class TemplateManager {
     }
 
     /// Capture a VM bundle as a golden image template.
-    func captureTemplate(fromBundlePath bundlePath: String, imageId: String) throws {
+    func captureTemplate(fromBundlePath bundlePath: String, imageId: String, guestOS: String = "macos") throws {
         let templatePath = "\(imagesPath)/\(imageId)"
         let fm = FileManager.default
 
         // Verify source bundle
         guard fm.fileExists(atPath: "\(bundlePath)/disk.img"),
-              fm.fileExists(atPath: "\(bundlePath)/hardware-model.dat"),
-              fm.fileExists(atPath: "\(bundlePath)/aux-storage"),
               fm.fileExists(atPath: "\(bundlePath)/installed") else {
             throw TemplateError.incompletBundle(bundlePath)
+        }
+
+        if guestOS == "macos" {
+            guard fm.fileExists(atPath: "\(bundlePath)/hardware-model.dat"),
+                  fm.fileExists(atPath: "\(bundlePath)/aux-storage") else {
+                throw TemplateError.incompletBundle(bundlePath)
+            }
         }
 
         try fm.createDirectory(atPath: templatePath, withIntermediateDirectories: true)
 
         try fm.copyItem(atPath: "\(bundlePath)/disk.img", toPath: "\(templatePath)/disk.img")
-        try fm.copyItem(atPath: "\(bundlePath)/aux-storage", toPath: "\(templatePath)/aux-storage")
-        try fm.copyItem(
-            atPath: "\(bundlePath)/hardware-model.dat",
-            toPath: "\(templatePath)/hardware-model.dat"
-        )
+
+        if guestOS == "macos" {
+            try fm.copyItem(atPath: "\(bundlePath)/aux-storage", toPath: "\(templatePath)/aux-storage")
+            try fm.copyItem(
+                atPath: "\(bundlePath)/hardware-model.dat",
+                toPath: "\(templatePath)/hardware-model.dat"
+            )
+        }
 
         // Write metadata
         let metadata: [String: String] = [
             "source_bundle": bundlePath,
             "captured_at": ISO8601DateFormatter().string(from: Date()),
+            "guest_os": guestOS,
         ]
         let data = try JSONEncoder().encode(metadata)
         try data.write(to: URL(fileURLWithPath: "\(templatePath)/metadata.json"))
 
-        logger.info("captured template \(imageId) from \(bundlePath)")
+        logger.info("captured template \(imageId) from \(bundlePath) (guest_os: \(guestOS))")
     }
 }
 

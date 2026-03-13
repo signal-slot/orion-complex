@@ -23,44 +23,119 @@ enum NodeAgentHelpers {
                     // Skip if VM already exists locally
                     guard vmManager.vmState(envId: env.id) == nil else { continue }
 
-                    logger.info("[\(env.id)] creating VM")
+                    let guestOS = env.guest_os ?? "macos"
+                    logger.info("[\(env.id)] creating \(guestOS) VM")
                     do {
                         let bundlePath = vmManager.bundlePath(envId: env.id)
 
-                        // If not installed yet, try golden image clone, then fall back to IPSW restore
-                        if !ipswRestore.isInstalled(bundlePath: bundlePath) {
-                            if let imageId = env.image_id, templateManager.hasTemplate(imageId: imageId) {
-                                logger.info("[\(env.id)] cloning from golden image \(imageId)")
-                                try templateManager.cloneTemplate(imageId: imageId, toBundlePath: bundlePath)
-                                logger.info("[\(env.id)] golden image cloned")
+                        if guestOS == "linux" {
+                            // Linux guest: clone from a pre-registered template (cloud image)
+                            if let imageId = env.image_id, templateManager.hasTemplate(imageId: imageId, guestOS: "linux") {
+                                logger.info("[\(env.id)] cloning Linux template \(imageId)")
+                                try templateManager.cloneLinuxTemplate(imageId: imageId, toBundlePath: bundlePath)
+                                logger.info("[\(env.id)] Linux template cloned")
                             } else {
-                                logger.info("[\(env.id)] no template available, performing IPSW restore...")
-                                let (ipswURL, restoreImage) = try await ipswRestore.downloadLatestIPSW()
-                                try await ipswRestore.installMacOS(
-                                    bundlePath: bundlePath,
-                                    ipswURL: ipswURL,
-                                    restoreImage: restoreImage
-                                )
-                                logger.info("[\(env.id)] macOS installed successfully")
+                                let imageDesc = env.image_id ?? "nil"
+                                logger.error("[\(env.id)] no template for Linux image \(imageDesc) — Linux images must be pre-registered")
+                                let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
+                                continue
                             }
 
-                            // Provision SSH keys and hostname on the disk before first boot
+                            // Write cloud-init seed files for Linux guest provisioning
+                            let sharedPath = "\(bundlePath)/shared"
+                            try FileManager.default.createDirectory(
+                                atPath: sharedPath,
+                                withIntermediateDirectories: true
+                            )
+
+                            let shortId = String(env.id.prefix(8))
+                            let hostname = "orion-\(shortId)"
+
                             var sshKeys: [String] = []
                             if let ownerId = env.owner_user_id {
                                 let keys = try await api.listUserSSHKeys(userId: ownerId)
                                 sshKeys = keys.compactMap(\.public_key)
                             }
-                            let shortId = String(env.id.prefix(8))
-                            let hostname = "orion-\(shortId)"
-                            logger.info("[\(env.id)] provisioning disk: \(sshKeys.count) SSH key(s), hostname=\(hostname)")
-                            try templateManager.provisionDisk(
-                                bundlePath: bundlePath,
-                                authorizedKeys: sshKeys,
-                                hostname: hostname
+
+                            // meta-data (instance identity)
+                            let metaData = """
+                            instance-id: \(env.id)
+                            local-hostname: \(hostname)
+                            """
+                            try metaData.write(
+                                toFile: "\(sharedPath)/meta-data",
+                                atomically: true,
+                                encoding: .utf8
                             )
+
+                            // user-data (cloud-init config)
+                            var userData = """
+                            #cloud-config
+                            hostname: \(hostname)
+                            manage_etc_hosts: true
+                            """
+                            if !sshKeys.isEmpty {
+                                userData += "\nssh_authorized_keys:\n"
+                                for key in sshKeys {
+                                    userData += "  - \(key)\n"
+                                }
+                            }
+                            try userData.write(
+                                toFile: "\(sharedPath)/user-data",
+                                atomically: true,
+                                encoding: .utf8
+                            )
+
+                            // Write authorized_keys for the guest agent to sync
+                            if !sshKeys.isEmpty {
+                                let keysContent = sshKeys.joined(separator: "\n") + "\n"
+                                try keysContent.write(
+                                    toFile: "\(sharedPath)/authorized_keys",
+                                    atomically: true,
+                                    encoding: .utf8
+                                )
+                            }
+
+                            logger.info("[\(env.id)] cloud-init seed written: \(sshKeys.count) SSH key(s), hostname=\(hostname)")
+
+                            try await vmManager.createVM(envId: env.id, guestOS: "linux")
+                        } else {
+                            // macOS guest: IPSW restore or golden image clone
+                            if !ipswRestore.isInstalled(bundlePath: bundlePath) {
+                                if let imageId = env.image_id, templateManager.hasTemplate(imageId: imageId) {
+                                    logger.info("[\(env.id)] cloning from golden image \(imageId)")
+                                    try templateManager.cloneTemplate(imageId: imageId, toBundlePath: bundlePath)
+                                    logger.info("[\(env.id)] golden image cloned")
+                                } else {
+                                    logger.info("[\(env.id)] no template available, performing IPSW restore...")
+                                    let (ipswURL, restoreImage) = try await ipswRestore.downloadLatestIPSW()
+                                    try await ipswRestore.installMacOS(
+                                        bundlePath: bundlePath,
+                                        ipswURL: ipswURL,
+                                        restoreImage: restoreImage
+                                    )
+                                    logger.info("[\(env.id)] macOS installed successfully")
+                                }
+
+                                // Provision SSH keys and hostname on the disk before first boot
+                                var sshKeys: [String] = []
+                                if let ownerId = env.owner_user_id {
+                                    let keys = try await api.listUserSSHKeys(userId: ownerId)
+                                    sshKeys = keys.compactMap(\.public_key)
+                                }
+                                let shortId = String(env.id.prefix(8))
+                                let hostname = "orion-\(shortId)"
+                                logger.info("[\(env.id)] provisioning disk: \(sshKeys.count) SSH key(s), hostname=\(hostname)")
+                                try templateManager.provisionDisk(
+                                    bundlePath: bundlePath,
+                                    authorizedKeys: sshKeys,
+                                    hostname: hostname
+                                )
+                            }
+
+                            try await vmManager.createVM(envId: env.id, guestOS: "macos")
                         }
 
-                        try await vmManager.createVM(envId: env.id)
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM running")
                     } catch {

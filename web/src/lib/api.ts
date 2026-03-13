@@ -30,7 +30,9 @@ import type {
 
 const BASE_URL =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "") ||
-  "http://localhost:3000";
+  (typeof window !== "undefined"
+    ? `${window.location.protocol}//${window.location.hostname}:3000`
+    : "http://localhost:3000");
 
 // ── Internal helpers ───────────────────────────────────────────────
 

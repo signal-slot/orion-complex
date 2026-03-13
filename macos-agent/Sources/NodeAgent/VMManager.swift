@@ -2,7 +2,7 @@ import Foundation
 @preconcurrency import Virtualization
 import Logging
 
-/// Manages macOS guest VMs using Apple's Virtualization.framework.
+/// Manages macOS and Linux guest VMs using Apple's Virtualization.framework.
 final class VMManager {
     private let bundleStorePath: String
     private let logger = Logger(label: "orion.node-agent.vm")
@@ -31,7 +31,20 @@ final class VMManager {
 
     // MARK: - VM lifecycle
 
-    func createVM(envId: String, cpuCount: Int = 4, memoryGB: Int = 8) async throws {
+    func createVM(envId: String, cpuCount: Int = 4, memoryGB: Int = 8, guestOS: String = "macos") async throws {
+        switch guestOS {
+        case "macos":
+            try await createMacOSVM(envId: envId, cpuCount: cpuCount, memoryGB: memoryGB)
+        case "linux":
+            try await createLinuxVM(envId: envId, cpuCount: cpuCount, memoryGB: memoryGB)
+        default:
+            throw VMError.unsupportedGuestOS(guestOS)
+        }
+    }
+
+    // MARK: - macOS VM creation
+
+    private func createMacOSVM(envId: String, cpuCount: Int, memoryGB: Int) async throws {
         logger.info("creating macOS VM for environment \(envId)")
 
         let bundlePath = "\(bundleStorePath)/\(envId).bundle"
@@ -132,6 +145,98 @@ final class VMManager {
 
         try await startVMOnMain(vm)
         logger.info("macOS VM started for environment \(envId)")
+
+        vms[envId] = RunningVM(vm: vm, bundlePath: bundlePath)
+    }
+
+    // MARK: - Linux VM creation
+
+    private func createLinuxVM(envId: String, cpuCount: Int, memoryGB: Int, diskSizeGB: Int = 64) async throws {
+        logger.info("creating Linux VM for environment \(envId)")
+
+        let bundlePath = "\(bundleStorePath)/\(envId).bundle"
+        try FileManager.default.createDirectory(atPath: bundlePath, withIntermediateDirectories: true)
+
+        let diskPath = "\(bundlePath)/disk.img"
+        let efiVariableStorePath = "\(bundlePath)/efi-variable-store"
+
+        // Create a disk image if it doesn't exist
+        if !FileManager.default.fileExists(atPath: diskPath) {
+            let diskSize: Int64 = Int64(diskSizeGB) * 1024 * 1024 * 1024
+            try createDiskImage(path: diskPath, size: diskSize)
+        }
+
+        // Configure the VM
+        let config = VZVirtualMachineConfiguration()
+
+        // Platform: Generic (Linux)
+        config.platform = VZGenericPlatformConfiguration()
+
+        // Boot loader: EFI
+        let efiBootLoader = VZEFIBootLoader()
+        if FileManager.default.fileExists(atPath: efiVariableStorePath) {
+            efiBootLoader.variableStore = VZEFIVariableStore(
+                url: URL(fileURLWithPath: efiVariableStorePath)
+            )
+        } else {
+            efiBootLoader.variableStore = try VZEFIVariableStore(
+                creatingVariableStoreAt: URL(fileURLWithPath: efiVariableStorePath)
+            )
+        }
+        config.bootLoader = efiBootLoader
+
+        // CPU & memory
+        config.cpuCount = max(cpuCount, VZVirtualMachineConfiguration.minimumAllowedCPUCount)
+        config.memorySize = UInt64(memoryGB) * 1024 * 1024 * 1024
+        config.memorySize = max(
+            config.memorySize,
+            VZVirtualMachineConfiguration.minimumAllowedMemorySize
+        )
+
+        // Storage
+        let diskAttachment = try VZDiskImageStorageDeviceAttachment(
+            url: URL(fileURLWithPath: diskPath),
+            readOnly: false
+        )
+        config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)]
+
+        // Network (NAT)
+        let networkConfig = VZVirtioNetworkDeviceConfiguration()
+        networkConfig.attachment = VZNATNetworkDeviceAttachment()
+        config.networkDevices = [networkConfig]
+
+        // Keyboard & pointing device
+        config.keyboards = [VZUSBKeyboardConfiguration()]
+        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+
+        // Graphics: Virtio GPU
+        let graphicsConfig = VZVirtioGraphicsDeviceConfiguration()
+        graphicsConfig.scanouts = [
+            VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1920, heightInPixels: 1080)
+        ]
+        config.graphicsDevices = [graphicsConfig]
+
+        // Entropy (random number generator)
+        config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+        // Shared directory for guest agent communication
+        let sharedDir = VZVirtioFileSystemDeviceConfiguration(tag: "orion-shared")
+        let sharedPath = "\(bundlePath)/shared"
+        try FileManager.default.createDirectory(atPath: sharedPath, withIntermediateDirectories: true)
+        sharedDir.share = VZSingleDirectoryShare(
+            directory: VZSharedDirectory(url: URL(fileURLWithPath: sharedPath), readOnly: false)
+        )
+        config.directorySharingDevices = [sharedDir]
+
+        try config.validate()
+
+        // VZVirtualMachine must be created and used on the main queue
+        let vm = await MainActor.run {
+            VZVirtualMachine(configuration: config)
+        }
+
+        try await startVMOnMain(vm)
+        logger.info("Linux VM started for environment \(envId)")
 
         vms[envId] = RunningVM(vm: vm, bundlePath: bundlePath)
     }
@@ -283,11 +388,11 @@ final class VMManager {
     }
 
     /// Import a VM bundle that was migrated from another node.
-    func importForMigration(envId: String, cpuCount: Int = 4, memoryGB: Int = 8) async throws {
+    func importForMigration(envId: String, cpuCount: Int = 4, memoryGB: Int = 8, guestOS: String = "macos") async throws {
         logger.info("importing migrated VM \(envId)")
 
         // The bundle should already be at the expected path
-        try await createVM(envId: envId, cpuCount: cpuCount, memoryGB: memoryGB)
+        try await createVM(envId: envId, cpuCount: cpuCount, memoryGB: memoryGB, guestOS: guestOS)
 
         // If saved state exists, restore it and the VM will be paused
         let bundlePath = "\(bundleStorePath)/\(envId).bundle"
@@ -449,6 +554,7 @@ enum VMError: Error, CustomStringConvertible {
     case noSupportedHardwareModel
     case invalidMachineIdentifier
     case snapshotNotFound(String)
+    case unsupportedGuestOS(String)
 
     var description: String {
         switch self {
@@ -458,6 +564,7 @@ enum VMError: Error, CustomStringConvertible {
         case .noSupportedHardwareModel: return "no supported macOS hardware model found"
         case .invalidMachineIdentifier: return "invalid machine identifier data"
         case .snapshotNotFound(let id): return "snapshot not found: \(id)"
+        case .unsupportedGuestOS(let os): return "unsupported guest OS: \(os)"
         }
     }
 }
