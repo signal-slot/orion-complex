@@ -92,6 +92,19 @@ export default function EnvironmentDetailPage() {
     }
   }
 
+  async function handleTogglePortForwarding() {
+    if (!env) return;
+    setActionLoading("port-forwarding");
+    try {
+      const updated = await api.togglePortForwarding(envId, !env.port_forwarding);
+      setEnv(updated);
+    } catch (err) {
+      console.error("Failed to toggle port forwarding:", err);
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
   async function handleCreateSnapshot() {
     setCreatingSnapshot(true);
     try {
@@ -124,6 +137,7 @@ export default function EnvironmentDetailPage() {
 
   const state = env.state ?? "";
   const isTransient = TRANSIENT_STATES.has(state);
+  const isAgentManaged = env.provider === "macos" || env.provider === "virtualization";
 
   return (
     <div className="space-y-8">
@@ -185,13 +199,34 @@ export default function EnvironmentDetailPage() {
       {/* Access Section */}
       {state === "running" && (
         <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-6">
-          <h2 className="text-sm font-medium text-zinc-400 mb-3">Access</h2>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-medium text-zinc-400">Access</h2>
+            {isAgentManaged && (
+              <label className="flex items-center gap-2 cursor-pointer">
+                <span className="text-xs text-zinc-500">Port Forwarding</span>
+                <button
+                  onClick={handleTogglePortForwarding}
+                  disabled={actionLoading === "port-forwarding"}
+                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                    env.port_forwarding ? "bg-indigo-600" : "bg-zinc-700"
+                  } disabled:opacity-50`}
+                >
+                  <span
+                    className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                      env.port_forwarding ? "translate-x-4.5" : "translate-x-0.5"
+                    }`}
+                  />
+                </button>
+              </label>
+            )}
+          </div>
           <div className="space-y-3">
-            {sshEndpoint && (() => {
+            {/* Local access (mDNS) */}
+            {sshEndpoint && !env.port_forwarding && (() => {
               const vmHost = `orion-${env.id.slice(0, 8)}.local`;
               return (
                 <div>
-                  <p className="text-xs text-zinc-500 mb-1.5">SSH</p>
+                  <p className="text-xs text-zinc-500 mb-1.5">SSH (local)</p>
                   <div className="flex items-center gap-3">
                     <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-green-400 font-mono">
                       ssh root@{vmHost}
@@ -206,9 +241,9 @@ export default function EnvironmentDetailPage() {
                 </div>
               );
             })()}
-            {env.guest_os === "macos" && (
+            {!env.port_forwarding && env.guest_os === "macos" && (
               <div>
-                <p className="text-xs text-zinc-500 mb-1.5">Screen Sharing (VNC)</p>
+                <p className="text-xs text-zinc-500 mb-1.5">Screen Sharing (local)</p>
                 <div className="flex items-center gap-3">
                   <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-blue-400 font-mono">
                     vnc://orion-{env.id.slice(0, 8)}.local
@@ -221,6 +256,42 @@ export default function EnvironmentDetailPage() {
                   </button>
                 </div>
               </div>
+            )}
+            {/* Port-forwarded access (LAN) */}
+            {env.port_forwarding === 1 && env.ssh_host && env.ssh_port && (
+              <div>
+                <p className="text-xs text-zinc-500 mb-1.5">SSH (LAN)</p>
+                <div className="flex items-center gap-3">
+                  <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-green-400 font-mono">
+                    ssh root@{env.ssh_host} -p {env.ssh_port}
+                  </code>
+                  <button
+                    onClick={() => navigator.clipboard.writeText(`ssh root@${env.ssh_host} -p ${env.ssh_port}`)}
+                    className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            )}
+            {env.port_forwarding === 1 && env.vnc_host && env.vnc_port && (
+              <div>
+                <p className="text-xs text-zinc-500 mb-1.5">VNC (LAN)</p>
+                <div className="flex items-center gap-3">
+                  <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-blue-400 font-mono">
+                    vnc://{env.vnc_host}:{env.vnc_port}
+                  </code>
+                  <button
+                    onClick={() => navigator.clipboard.writeText(`vnc://${env.vnc_host}:${env.vnc_port}`)}
+                    className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            )}
+            {env.port_forwarding === 1 && !env.ssh_host && (
+              <p className="text-sm text-zinc-500">Setting up port forwarding...</p>
             )}
           </div>
         </div>

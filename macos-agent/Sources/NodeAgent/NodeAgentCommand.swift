@@ -58,6 +58,7 @@ struct NodeAgentCommand: AsyncParsableCommand {
         let vmManager = VMManager(bundleStorePath: effectiveBundleStore)
         let ipswRestore = IPSWRestore(bundleStorePath: effectiveBundleStore)
         let templateManager = TemplateManager(bundleStorePath: effectiveBundleStore)
+        let portForwarder = PortForwarder()
 
         // Download IPSW if requested
         if downloadIpsw {
@@ -123,6 +124,7 @@ struct NodeAgentCommand: AsyncParsableCommand {
                 vmManager: vmManager,
                 ipswRestore: ipswRestore,
                 templateManager: templateManager,
+                portForwarder: portForwarder,
                 nodeId: resolvedNodeId,
                 logger: logger
             )

@@ -65,6 +65,11 @@ pub struct Environment {
     pub vcpus: Option<i64>,
     pub memory_bytes: Option<i64>,
     pub disk_bytes: Option<i64>,
+    pub port_forwarding: i64,
+    pub ssh_host: Option<String>,
+    pub ssh_port: Option<i64>,
+    pub vnc_host: Option<String>,
+    pub vnc_port: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

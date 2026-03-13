@@ -311,6 +311,16 @@ export async function migrateEnvironment(
   });
 }
 
+export async function togglePortForwarding(
+  envId: string,
+  enabled: boolean,
+): Promise<Environment> {
+  return request<Environment>(`/v1/environments/${envId}/port-forwarding`, {
+    method: "POST",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 export async function extendEnvironmentTtl(
   envId: string,
   body: ExtendTtlRequest,
@@ -432,6 +442,7 @@ export const api = {
   rebootEnvironment,
   forceRebootEnvironment,
   migrateEnvironment,
+  togglePortForwarding,
   extendEnvironmentTtl,
   listSnapshots,
   createSnapshot,

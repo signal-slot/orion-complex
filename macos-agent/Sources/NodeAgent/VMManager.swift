@@ -13,6 +13,7 @@ final class VMManager {
     struct RunningVM {
         let vm: VZVirtualMachine
         let bundlePath: String
+        var macAddressString: String?
     }
 
     init(bundleStorePath: String) {
@@ -27,6 +28,11 @@ final class VMManager {
 
     func bundlePath(envId: String) -> String {
         return "\(bundleStorePath)/\(envId).bundle"
+    }
+
+    /// Get the MAC address of a running VM (for DHCP lease matching).
+    func macAddress(envId: String) -> String? {
+        return vms[envId]?.macAddressString
     }
 
     // MARK: - VM lifecycle
@@ -107,6 +113,7 @@ final class VMManager {
         // Network (NAT)
         let networkConfig = VZVirtioNetworkDeviceConfiguration()
         networkConfig.attachment = VZNATNetworkDeviceAttachment()
+        let macMAC = networkConfig.macAddress.string
         config.networkDevices = [networkConfig]
 
         // Keyboard & pointing device
@@ -146,7 +153,7 @@ final class VMManager {
         try await startVMOnMain(vm)
         logger.info("macOS VM started for environment \(envId)")
 
-        vms[envId] = RunningVM(vm: vm, bundlePath: bundlePath)
+        vms[envId] = RunningVM(vm: vm, bundlePath: bundlePath, macAddressString: macMAC)
     }
 
     // MARK: - Linux VM creation
@@ -203,6 +210,7 @@ final class VMManager {
         // Network (NAT)
         let networkConfig = VZVirtioNetworkDeviceConfiguration()
         networkConfig.attachment = VZNATNetworkDeviceAttachment()
+        let linuxMAC = networkConfig.macAddress.string
         config.networkDevices = [networkConfig]
 
         // Keyboard & pointing device
@@ -238,7 +246,7 @@ final class VMManager {
         try await startVMOnMain(vm)
         logger.info("Linux VM started for environment \(envId)")
 
-        vms[envId] = RunningVM(vm: vm, bundlePath: bundlePath)
+        vms[envId] = RunningVM(vm: vm, bundlePath: bundlePath, macAddressString: linuxMAC)
     }
 
     func destroyVM(envId: String) async throws {

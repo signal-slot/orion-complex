@@ -49,6 +49,14 @@ pub fn routes() -> Router<AppState> {
             "/v1/environments/{env_id}/extend-ttl",
             post(extend_ttl),
         )
+        .route(
+            "/v1/environments/{env_id}/port-forwarding",
+            post(toggle_port_forwarding),
+        )
+        .route(
+            "/v1/environments/{env_id}/endpoints",
+            put(update_endpoints),
+        )
 }
 
 /// Returns true if the provider is managed by an external node agent (macOS)
@@ -432,6 +440,15 @@ async fn ssh_endpoint(
 
     let provider = env.provider.as_deref().unwrap_or("libvirt");
     if is_agent_managed(provider) {
+        // If port forwarding endpoints are set, return those
+        if let (Some(host), Some(port)) = (&env.ssh_host, env.ssh_port) {
+            return Ok(Json(serde_json::json!({
+                "env_id": env.id,
+                "host": host,
+                "port": port,
+            })));
+        }
+        // Fallback: return node hostname with port 22 (local-only)
         let node = sqlx::query_as::<_, crate::models::Node>(
             "SELECT * FROM nodes WHERE id = ?",
         )
@@ -476,8 +493,16 @@ async fn vnc_endpoint(
 
     let provider = env.provider.as_deref().unwrap_or("libvirt");
     if is_agent_managed(provider) {
+        // If port forwarding endpoints are set, return those
+        if let (Some(host), Some(port)) = (&env.vnc_host, env.vnc_port) {
+            return Ok(Json(serde_json::json!({
+                "env_id": env.id,
+                "host": host,
+                "port": port,
+            })));
+        }
         return Err(AppError::BadRequest(
-            "VNC not available for macOS VMs (use Screen Sharing instead)".into(),
+            "VNC endpoint not available — enable port forwarding first".into(),
         ));
     }
 
@@ -495,6 +520,80 @@ async fn vnc_endpoint(
         "username": "ubuntu",
         "password": "orion",
     })))
+}
+
+// ── Port forwarding ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct TogglePortForwardingRequest {
+    enabled: bool,
+}
+
+async fn toggle_port_forwarding(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(env_id): Path<String>,
+    Json(req): Json<TogglePortForwardingRequest>,
+) -> Result<Json<Environment>, AppError> {
+    let env = fetch_env(&state, &env_id).await?;
+    check_env_owner(&user.0, &env)?;
+
+    let val: i64 = if req.enabled { 1 } else { 0 };
+
+    // If disabling, also clear the endpoint fields
+    if !req.enabled {
+        sqlx::query(
+            "UPDATE environments SET port_forwarding = 0, ssh_host = NULL, ssh_port = NULL, vnc_host = NULL, vnc_port = NULL WHERE id = ?",
+        )
+        .bind(&env_id)
+        .execute(&state.db)
+        .await?;
+    } else {
+        sqlx::query("UPDATE environments SET port_forwarding = ? WHERE id = ?")
+            .bind(val)
+            .bind(&env_id)
+            .execute(&state.db)
+            .await?;
+    }
+
+    let env = sqlx::query_as::<_, Environment>("SELECT * FROM environments WHERE id = ?")
+        .bind(&env_id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Json(env))
+}
+
+/// Called by the node agent to report forwarded SSH/VNC endpoints.
+#[derive(Debug, Deserialize)]
+struct UpdateEndpointsRequest {
+    ssh_host: Option<String>,
+    ssh_port: Option<i64>,
+    vnc_host: Option<String>,
+    vnc_port: Option<i64>,
+}
+
+async fn update_endpoints(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(env_id): Path<String>,
+    Json(req): Json<UpdateEndpointsRequest>,
+) -> Result<Json<Environment>, AppError> {
+    sqlx::query(
+        "UPDATE environments SET ssh_host = ?, ssh_port = ?, vnc_host = ?, vnc_port = ? WHERE id = ?",
+    )
+    .bind(&req.ssh_host)
+    .bind(req.ssh_port)
+    .bind(&req.vnc_host)
+    .bind(req.vnc_port)
+    .bind(&env_id)
+    .execute(&state.db)
+    .await?;
+
+    let env = sqlx::query_as::<_, Environment>("SELECT * FROM environments WHERE id = ?")
+        .bind(&env_id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Json(env))
 }
 
 async fn transition_state(

@@ -7,6 +7,7 @@ enum NodeAgentHelpers {
         vmManager: VMManager,
         ipswRestore: IPSWRestore,
         templateManager: TemplateManager,
+        portForwarder: PortForwarder,
         nodeId: String?,
         logger: Logger
     ) async {
@@ -138,12 +139,24 @@ enum NodeAgentHelpers {
 
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM running")
+
+                        // Set up port forwarding if enabled
+                        if env.port_forwarding == 1 {
+                            await setupPortForwarding(
+                                envId: env.id,
+                                vmManager: vmManager,
+                                portForwarder: portForwarder,
+                                api: api,
+                                logger: logger
+                            )
+                        }
                     } catch {
                         logger.error("[\(env.id)] failed to create VM: \(error)")
                         let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
                     }
 
                 case "suspending":
+                    portForwarder.stopForwarding(envId: env.id)
                     logger.info("[\(env.id)] suspending VM")
                     do {
                         try await vmManager.suspendVM(envId: env.id)
@@ -160,6 +173,16 @@ enum NodeAgentHelpers {
                         try await vmManager.resumeVM(envId: env.id)
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM resumed")
+                        // Re-establish port forwarding if enabled
+                        if env.port_forwarding == 1 {
+                            await setupPortForwarding(
+                                envId: env.id,
+                                vmManager: vmManager,
+                                portForwarder: portForwarder,
+                                api: api,
+                                logger: logger
+                            )
+                        }
                     } catch {
                         logger.error("[\(env.id)] failed to resume: \(error)")
                         let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
@@ -202,6 +225,7 @@ enum NodeAgentHelpers {
                     }
 
                 case "destroying":
+                    portForwarder.stopForwarding(envId: env.id)
                     logger.info("[\(env.id)] destroying VM")
                     do {
                         try await vmManager.destroyVM(envId: env.id)
@@ -231,12 +255,77 @@ enum NodeAgentHelpers {
                         }
                     }
 
+                    // Handle port forwarding toggle
+                    if env.port_forwarding == 1 && !portForwarder.isForwarding(envId: env.id) {
+                        await setupPortForwarding(
+                            envId: env.id,
+                            vmManager: vmManager,
+                            portForwarder: portForwarder,
+                            api: api,
+                            logger: logger
+                        )
+                    } else if env.port_forwarding != 1 && portForwarder.isForwarding(envId: env.id) {
+                        portForwarder.stopForwarding(envId: env.id)
+                        let _ = try? await api.updateEndpoints(
+                            envId: env.id,
+                            endpoints: .init(ssh_host: nil, ssh_port: nil, vnc_host: nil, vnc_port: nil)
+                        )
+                        logger.info("[\(env.id)] port forwarding disabled")
+                    }
+
                 default:
                     break
                 }
             }
         } catch {
             logger.error("poll error: \(error)")
+        }
+    }
+
+    // MARK: - Port forwarding helper
+
+    private static func setupPortForwarding(
+        envId: String,
+        vmManager: VMManager,
+        portForwarder: PortForwarder,
+        api: APIClient,
+        logger: Logger
+    ) async {
+        var vmIP: String?
+
+        // Try MAC-based discovery first (works for VMs created in this session)
+        if let macAddress = vmManager.macAddress(envId: envId) {
+            vmIP = await portForwarder.discoverVMIP(macAddress: macAddress, retries: 10, interval: 2)
+        }
+
+        // Fallback: resolve by mDNS hostname (works for pre-existing VMs)
+        if vmIP == nil {
+            let shortId = String(envId.prefix(8))
+            let hostname = "orion-\(shortId)"
+            logger.info("[\(envId)] trying hostname resolution for \(hostname)")
+            vmIP = await portForwarder.discoverVMIPByHostname(hostname: hostname, retries: 10, interval: 2)
+        }
+
+        guard let vmIP = vmIP else {
+            logger.warning("[\(envId)] cannot set up port forwarding: VM IP not found")
+            return
+        }
+
+        do {
+            let (sshPort, vncPort) = try portForwarder.startForwarding(envId: envId, vmIP: vmIP)
+            let hostIP = PortForwarder.hostLANIP() ?? "127.0.0.1"
+            let _ = try await api.updateEndpoints(
+                envId: envId,
+                endpoints: .init(
+                    ssh_host: hostIP,
+                    ssh_port: sshPort,
+                    vnc_host: hostIP,
+                    vnc_port: vncPort
+                )
+            )
+            logger.info("[\(envId)] port forwarding reported: SSH=\(hostIP):\(sshPort), VNC=\(hostIP):\(vncPort)")
+        } catch {
+            logger.error("[\(envId)] failed to set up port forwarding: \(error)")
         }
     }
 

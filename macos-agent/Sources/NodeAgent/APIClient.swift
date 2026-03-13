@@ -51,6 +51,7 @@ actor APIClient {
         let state: String?
         let created_at: Int64?
         let expires_at: Int64?
+        let port_forwarding: Int?
     }
 
     func listEnvironments() async throws -> [Environment] {
@@ -67,6 +68,19 @@ actor APIClient {
 
     func deleteEnvironment(envId: String) async throws {
         try await deleteRequest("/v1/environments/\(envId)")
+    }
+
+    // MARK: - Port forwarding endpoints
+
+    struct UpdateEndpointsRequest: Codable {
+        let ssh_host: String?
+        let ssh_port: Int?
+        let vnc_host: String?
+        let vnc_port: Int?
+    }
+
+    func updateEndpoints(envId: String, endpoints: UpdateEndpointsRequest) async throws -> Environment {
+        return try await put("/v1/environments/\(envId)/endpoints", body: endpoints)
     }
 
     // MARK: - Node heartbeat

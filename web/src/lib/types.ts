@@ -89,6 +89,11 @@ export interface Environment {
   vcpus: number | null;
   memory_bytes: number | null;
   disk_bytes: number | null;
+  port_forwarding: number;
+  ssh_host: string | null;
+  ssh_port: number | null;
+  vnc_host: string | null;
+  vnc_port: number | null;
 }
 
 export interface Snapshot {
