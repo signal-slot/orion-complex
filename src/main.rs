@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use webauthn_rs::WebauthnBuilder;
 
 use orion_complex::AppState;
 use orion_complex::auth::AuthConfig;
@@ -28,11 +29,22 @@ async fn main() {
 
     let vm_provider: Arc<dyn VmProvider> = Arc::new(LibvirtProvider::new(&config.libvirt_uri, &config.data_dir));
 
+    let rp_origin = url::Url::parse(&auth_config.webauthn_rp_origin)
+        .expect("invalid WEBAUTHN_RP_ORIGIN");
+    let webauthn = Arc::new(
+        WebauthnBuilder::new(&auth_config.webauthn_rp_id, &rp_origin)
+            .expect("failed to build webauthn")
+            .rp_name(&auth_config.webauthn_rp_name)
+            .build()
+            .expect("failed to build webauthn"),
+    );
+
     let state = AppState {
         db: pool,
         auth_config,
         http_client: reqwest::Client::new(),
         vm_provider,
+        webauthn,
     };
 
     // Reconcile environments stuck in transient states from a previous crash

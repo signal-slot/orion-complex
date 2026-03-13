@@ -36,6 +36,9 @@ mod helpers {
             google_client_id: None,
             microsoft_client_id: None,
             allowed_domains: vec![],
+            webauthn_rp_id: "localhost".into(),
+            webauthn_rp_origin: "http://localhost:3000".into(),
+            webauthn_rp_name: "Test".into(),
         };
 
         // Create a test admin user
@@ -62,11 +65,22 @@ mod helpers {
         let vm_provider: Arc<dyn orion_complex::vm::VmProvider> =
             Arc::new(StubProvider::new());
 
+        let webauthn = std::sync::Arc::new(
+            webauthn_rs::WebauthnBuilder::new(
+                "localhost",
+                &url::Url::parse("http://localhost:3000").unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap(),
+        );
+
         let state = AppState {
             db: pool,
             auth_config,
             http_client: reqwest::Client::new(),
             vm_provider,
+            webauthn,
         };
 
         let app = orion_complex::api::router()
@@ -234,6 +248,9 @@ async fn test_node_register_requires_admin() {
             google_client_id: None,
             microsoft_client_id: None,
             allowed_domains: vec![],
+            webauthn_rp_id: "localhost".into(),
+            webauthn_rp_origin: "http://localhost:3000".into(),
+            webauthn_rp_name: "Test".into(),
         },
         "test-user",
     ).unwrap();
@@ -503,6 +520,9 @@ async fn test_owner_scoped_environments() {
             google_client_id: None,
             microsoft_client_id: None,
             allowed_domains: vec![],
+            webauthn_rp_id: "localhost".into(),
+            webauthn_rp_origin: "http://localhost:3000".into(),
+            webauthn_rp_name: "Test".into(),
         },
         "test-user",
     );

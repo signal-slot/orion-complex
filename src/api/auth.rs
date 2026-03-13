@@ -17,7 +17,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn list_providers(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mut providers = Vec::new();
+    let mut providers = vec!["webauthn"];
     if state.auth_config.google_client_id.is_some() {
         providers.push("google");
     }

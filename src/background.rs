@@ -102,6 +102,13 @@ async fn reap_expired(
             });
         }
     }
+    // Clean up expired WebAuthn challenges
+    sqlx::query("DELETE FROM webauthn_challenges WHERE expires_at < ?")
+        .bind(now)
+        .execute(db)
+        .await
+        .ok();
+
     Ok(())
 }
 

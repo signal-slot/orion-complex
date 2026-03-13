@@ -103,6 +103,28 @@ pub struct EnvironmentEvent {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WebauthnCredential {
+    pub id: String,
+    pub user_id: String,
+    pub credential_id: String,
+    pub credential_json: String,
+    pub name: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WebauthnChallenge {
+    pub id: String,
+    pub challenge_type: String,
+    pub state_json: String,
+    pub user_id: Option<String>,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
 // --- Request types ---
 
 #[derive(Debug, Deserialize)]

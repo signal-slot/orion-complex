@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::SqlitePool;
+use webauthn_rs::Webauthn;
 
 use auth::AuthConfig;
 use vm::VmProvider;
@@ -23,6 +24,7 @@ pub struct AppState {
     pub auth_config: AuthConfig,
     pub http_client: reqwest::Client,
     pub vm_provider: Arc<dyn VmProvider>,
+    pub webauthn: Arc<Webauthn>,
 }
 
 pub fn unix_now() -> i64 {

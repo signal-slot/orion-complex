@@ -117,6 +117,47 @@ export async function getMe(): Promise<User> {
   return request<User>("/v1/auth/me");
 }
 
+// ── WebAuthn ──────────────────────────────────────────────────────
+
+export async function webauthnRegisterBegin(body: {
+  email: string;
+  display_name?: string;
+}): Promise<{ challenge_id: string; publicKey: unknown }> {
+  return request("/v1/auth/webauthn/register/begin", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function webauthnRegisterComplete(body: {
+  challenge_id: string;
+  credential: unknown;
+}): Promise<LoginResponse> {
+  return request("/v1/auth/webauthn/register/complete", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function webauthnLoginBegin(body: {
+  email: string;
+}): Promise<{ challenge_id: string; publicKey: unknown }> {
+  return request("/v1/auth/webauthn/login/begin", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function webauthnLoginComplete(body: {
+  challenge_id: string;
+  credential: unknown;
+}): Promise<LoginResponse> {
+  return request("/v1/auth/webauthn/login/complete", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 // ── Users (admin) ──────────────────────────────────────────────────
 
 export async function listUsers(params?: PaginationParams): Promise<User[]> {
@@ -410,6 +451,10 @@ export const api = {
   getAuthProviders,
   login,
   getMe,
+  webauthnRegisterBegin,
+  webauthnRegisterComplete,
+  webauthnLoginBegin,
+  webauthnLoginComplete,
   listUsers,
   getUser,
   updateUserRole,

@@ -9,6 +9,7 @@ pub mod snapshots;
 pub mod ssh_keys;
 pub mod tasks;
 pub mod users;
+pub mod webauthn;
 
 use axum::Router;
 use serde::Deserialize;
@@ -30,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .merge(snapshots::routes())
         .merge(tasks::routes())
         .merge(events::routes())
+        .merge(webauthn::routes())
 }
 
 #[derive(Debug, Deserialize)]

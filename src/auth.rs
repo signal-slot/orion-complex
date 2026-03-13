@@ -16,6 +16,9 @@ pub struct AuthConfig {
     pub google_client_id: Option<String>,
     pub microsoft_client_id: Option<String>,
     pub allowed_domains: Vec<String>,
+    pub webauthn_rp_id: String,
+    pub webauthn_rp_origin: String,
+    pub webauthn_rp_name: String,
 }
 
 impl AuthConfig {
@@ -40,12 +43,22 @@ impl AuthConfig {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let webauthn_rp_id =
+            env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "localhost".into());
+        let webauthn_rp_origin =
+            env::var("WEBAUTHN_RP_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".into());
+        let webauthn_rp_name =
+            env::var("WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Orion Complex".into());
+
         Self {
             jwt_secret,
             jwt_expiry_secs,
             google_client_id,
             microsoft_client_id,
             allowed_domains,
+            webauthn_rp_id,
+            webauthn_rp_origin,
+            webauthn_rp_name,
         }
     }
 }

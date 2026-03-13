@@ -1,0 +1,387 @@
+use axum::Json;
+use axum::Router;
+use axum::extract::State;
+use axum::routing::post;
+use serde::Deserialize;
+use webauthn_rs::prelude::*;
+
+use crate::AppState;
+use crate::auth::create_session_token;
+use crate::error::AppError;
+use crate::models::User;
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/v1/auth/webauthn/register/begin", post(register_begin))
+        .route(
+            "/v1/auth/webauthn/register/complete",
+            post(register_complete),
+        )
+        .route("/v1/auth/webauthn/login/begin", post(login_begin))
+        .route("/v1/auth/webauthn/login/complete", post(login_complete))
+}
+
+// ── Registration ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RegisterBeginRequest {
+    email: String,
+    display_name: Option<String>,
+}
+
+async fn register_begin(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterBeginRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let email = req.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return Err(AppError::BadRequest("invalid email".into()));
+    }
+
+    // Check allowed domains
+    let email_domain = email.split('@').nth(1).unwrap_or("").to_string();
+    if !state.auth_config.allowed_domains.is_empty()
+        && !state.auth_config.allowed_domains.contains(&email_domain)
+    {
+        return Err(AppError::BadRequest(format!(
+            "domain '{email_domain}' is not allowed"
+        )));
+    }
+
+    // Check if user already exists
+    let existing_user =
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = ?")
+            .bind(&email)
+            .fetch_optional(&state.db)
+            .await?;
+
+    // Load existing credentials to exclude (prevent duplicate registrations)
+    let exclude_creds: Vec<CredentialID> = if let Some(ref user) = existing_user {
+        load_passkeys(&state.db, &user.id)
+            .await?
+            .into_iter()
+            .map(|pk| pk.cred_id().clone())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let user_uuid = if let Some(ref user) = existing_user {
+        Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::new_v4())
+    } else {
+        Uuid::new_v4()
+    };
+
+    let display_name = req
+        .display_name
+        .as_deref()
+        .unwrap_or(email.split('@').next().unwrap_or(&email));
+
+    let (ccr, passkey_reg) = state
+        .webauthn
+        .start_passkey_registration(user_uuid, &email, display_name, Some(exclude_creds))
+        .map_err(|e| AppError::Internal(format!("webauthn error: {e}")))?;
+
+    // Store challenge state
+    let challenge_id = uuid::Uuid::new_v4().to_string();
+    let now = crate::unix_now();
+    let state_json = serde_json::to_string(&passkey_reg)
+        .map_err(|e| AppError::Internal(format!("serialize error: {e}")))?;
+
+    sqlx::query(
+        "INSERT INTO webauthn_challenges (id, challenge_type, state_json, user_id, email, display_name, created_at, expires_at)
+         VALUES (?, 'registration', ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&challenge_id)
+    .bind(&state_json)
+    .bind(existing_user.as_ref().map(|u| &u.id))
+    .bind(&email)
+    .bind(display_name)
+    .bind(now)
+    .bind(now + 300) // 5 minutes
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "challenge_id": challenge_id,
+        "publicKey": ccr,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterCompleteRequest {
+    challenge_id: String,
+    credential: RegisterPublicKeyCredential,
+}
+
+async fn register_complete(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterCompleteRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let now = crate::unix_now();
+
+    // Look up and consume challenge
+    let challenge = sqlx::query_as::<_, crate::models::WebauthnChallenge>(
+        "SELECT * FROM webauthn_challenges WHERE id = ? AND challenge_type = 'registration' AND expires_at > ?",
+    )
+    .bind(&req.challenge_id)
+    .bind(now)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::BadRequest("invalid or expired challenge".into()))?;
+
+    // Delete challenge (single-use)
+    sqlx::query("DELETE FROM webauthn_challenges WHERE id = ?")
+        .bind(&req.challenge_id)
+        .execute(&state.db)
+        .await?;
+
+    // Deserialize registration state
+    let passkey_reg: PasskeyRegistration = serde_json::from_str(&challenge.state_json)
+        .map_err(|e| AppError::Internal(format!("deserialize error: {e}")))?;
+
+    // Complete registration
+    let passkey = state
+        .webauthn
+        .finish_passkey_registration(&req.credential, &passkey_reg)
+        .map_err(|e| AppError::BadRequest(format!("registration failed: {e}")))?;
+
+    // Get or create user
+    let user = if let Some(user_id) = &challenge.user_id {
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await?
+    } else {
+        // Check if this is the first user (auto-admin)
+        let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+            .fetch_one(&state.db)
+            .await?;
+        let role = if user_count.0 == 0 { "admin" } else { "user" };
+
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let email = challenge.email.as_deref().unwrap_or("");
+        let email_domain = email.split('@').nth(1).unwrap_or("");
+        let display_name = challenge.display_name.as_deref().unwrap_or("");
+
+        sqlx::query(
+            "INSERT INTO users (id, provider, provider_subject, email, email_domain, display_name, role, disabled, created_at)
+             VALUES (?, 'webauthn', ?, ?, ?, ?, ?, 0, ?)",
+        )
+        .bind(&user_id)
+        .bind(&user_id)
+        .bind(email)
+        .bind(email_domain)
+        .bind(display_name)
+        .bind(role)
+        .bind(now)
+        .execute(&state.db)
+        .await?;
+
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+            .bind(&user_id)
+            .fetch_one(&state.db)
+            .await?
+    };
+
+    if user.disabled != 0 {
+        return Err(AppError::BadRequest("user is disabled".into()));
+    }
+
+    // Store credential
+    let cred_id = uuid::Uuid::new_v4().to_string();
+    let credential_id_b64 = base64url_encode(passkey.cred_id());
+    let credential_json = serde_json::to_string(&passkey)
+        .map_err(|e| AppError::Internal(format!("serialize error: {e}")))?;
+
+    sqlx::query(
+        "INSERT INTO webauthn_credentials (id, user_id, credential_id, credential_json, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&cred_id)
+    .bind(&user.id)
+    .bind(&credential_id_b64)
+    .bind(&credential_json)
+    .bind(now)
+    .execute(&state.db)
+    .await?;
+
+    // Issue session token
+    let token = create_session_token(&state.auth_config, &user.id)
+        .map_err(|e| AppError::Internal(format!("token error: {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "user": user,
+    })))
+}
+
+// ── Authentication ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct LoginBeginRequest {
+    email: String,
+}
+
+async fn login_begin(
+    State(state): State<AppState>,
+    Json(req): Json<LoginBeginRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let email = req.email.trim().to_lowercase();
+
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = ?")
+        .bind(&email)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("no account found for this email".into()))?;
+
+    if user.disabled != 0 {
+        return Err(AppError::BadRequest("user is disabled".into()));
+    }
+
+    let passkeys = load_passkeys(&state.db, &user.id).await?;
+    if passkeys.is_empty() {
+        return Err(AppError::BadRequest(
+            "no passkeys registered for this account".into(),
+        ));
+    }
+
+    let (rcr, passkey_auth) = state
+        .webauthn
+        .start_passkey_authentication(&passkeys)
+        .map_err(|e| AppError::Internal(format!("webauthn error: {e}")))?;
+
+    // Store challenge state
+    let challenge_id = uuid::Uuid::new_v4().to_string();
+    let now = crate::unix_now();
+    let state_json = serde_json::to_string(&passkey_auth)
+        .map_err(|e| AppError::Internal(format!("serialize error: {e}")))?;
+
+    sqlx::query(
+        "INSERT INTO webauthn_challenges (id, challenge_type, state_json, user_id, created_at, expires_at)
+         VALUES (?, 'authentication', ?, ?, ?, ?)",
+    )
+    .bind(&challenge_id)
+    .bind(&state_json)
+    .bind(&user.id)
+    .bind(now)
+    .bind(now + 300)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "challenge_id": challenge_id,
+        "publicKey": rcr,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginCompleteRequest {
+    challenge_id: String,
+    credential: PublicKeyCredential,
+}
+
+async fn login_complete(
+    State(state): State<AppState>,
+    Json(req): Json<LoginCompleteRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let now = crate::unix_now();
+
+    // Look up and consume challenge
+    let challenge = sqlx::query_as::<_, crate::models::WebauthnChallenge>(
+        "SELECT * FROM webauthn_challenges WHERE id = ? AND challenge_type = 'authentication' AND expires_at > ?",
+    )
+    .bind(&req.challenge_id)
+    .bind(now)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::BadRequest("invalid or expired challenge".into()))?;
+
+    sqlx::query("DELETE FROM webauthn_challenges WHERE id = ?")
+        .bind(&req.challenge_id)
+        .execute(&state.db)
+        .await?;
+
+    let passkey_auth: PasskeyAuthentication = serde_json::from_str(&challenge.state_json)
+        .map_err(|e| AppError::Internal(format!("deserialize error: {e}")))?;
+
+    let auth_result = state
+        .webauthn
+        .finish_passkey_authentication(&req.credential, &passkey_auth)
+        .map_err(|e| AppError::BadRequest(format!("authentication failed: {e}")))?;
+
+    // Find the user via challenge
+    let user_id = challenge
+        .user_id
+        .ok_or_else(|| AppError::Internal("challenge missing user_id".into()))?;
+
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        .bind(&user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("user not found".into()))?;
+
+    if user.disabled != 0 {
+        return Err(AppError::BadRequest("user is disabled".into()));
+    }
+
+    // Update credential counter to prevent cloning attacks
+    let cred_id_b64 = base64url_encode(auth_result.cred_id());
+    let cred_row = sqlx::query_as::<_, crate::models::WebauthnCredential>(
+        "SELECT * FROM webauthn_credentials WHERE credential_id = ?",
+    )
+    .bind(&cred_id_b64)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some(cred_row) = cred_row {
+        // Re-serialize the passkey with updated counter
+        if let Ok(mut passkey) =
+            serde_json::from_str::<Passkey>(&cred_row.credential_json)
+        {
+            passkey.update_credential(&auth_result);
+            if let Ok(updated_json) = serde_json::to_string(&passkey) {
+                let _ = sqlx::query(
+                    "UPDATE webauthn_credentials SET credential_json = ? WHERE id = ?",
+                )
+                .bind(&updated_json)
+                .bind(&cred_row.id)
+                .execute(&state.db)
+                .await;
+            }
+        }
+    }
+
+    // Issue session token
+    let token = create_session_token(&state.auth_config, &user.id)
+        .map_err(|e| AppError::Internal(format!("token error: {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "user": user,
+    })))
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+async fn load_passkeys(db: &sqlx::SqlitePool, user_id: &str) -> Result<Vec<Passkey>, AppError> {
+    let rows = sqlx::query_as::<_, crate::models::WebauthnCredential>(
+        "SELECT * FROM webauthn_credentials WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    let mut passkeys = Vec::new();
+    for row in rows {
+        let pk: Passkey = serde_json::from_str(&row.credential_json)
+            .map_err(|e| AppError::Internal(format!("credential deserialize error: {e}")))?;
+        passkeys.push(pk);
+    }
+    Ok(passkeys)
+}
+
+fn base64url_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
