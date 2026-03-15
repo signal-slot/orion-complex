@@ -44,6 +44,7 @@ pub fn routes() -> Router<AppState> {
             "/v1/environments/{env_id}/force-reboot",
             post(force_reboot),
         )
+        .route("/v1/environments/{env_id}/restart", post(restart))
         .route("/v1/environments/{env_id}/migrate", post(migrate))
         .route(
             "/v1/environments/{env_id}/extend-ttl",
@@ -127,34 +128,23 @@ async fn list_environments(
     user: AuthUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<Environment>>, AppError> {
-    let envs = if user.0.role.as_deref() == Some("admin") {
-        sqlx::query_as::<_, Environment>(
-            "SELECT * FROM environments ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        )
-        .bind(params.limit())
-        .bind(params.offset())
-        .fetch_all(&state.db)
-        .await?
-    } else {
-        sqlx::query_as::<_, Environment>(
-            "SELECT * FROM environments WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        )
-        .bind(&user.0.id)
-        .bind(params.limit())
-        .bind(params.offset())
-        .fetch_all(&state.db)
-        .await?
-    };
+    // All users can see all environments — this system manages shared resources
+    let envs = sqlx::query_as::<_, Environment>(
+        "SELECT * FROM environments ORDER BY created_at DESC LIMIT ? OFFSET ?",
+    )
+    .bind(params.limit())
+    .bind(params.offset())
+    .fetch_all(&state.db)
+    .await?;
     Ok(Json(envs))
 }
 
 async fn get_environment(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Path(env_id): Path<String>,
 ) -> Result<Json<Environment>, AppError> {
     let env = fetch_env(&state, &env_id).await?;
-    check_env_owner(&user.0, &env)?;
     Ok(Json(env))
 }
 
@@ -436,11 +426,10 @@ async fn destroy_environment(
 
 async fn ssh_endpoint(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Path(env_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let env = fetch_env(&state, &env_id).await?;
-    check_env_owner(&user.0, &env)?;
 
     let provider = env.provider.as_deref().unwrap_or("libvirt");
     if is_agent_managed(provider) {
@@ -489,11 +478,10 @@ async fn ssh_endpoint(
 
 async fn vnc_endpoint(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Path(env_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let env = fetch_env(&state, &env_id).await?;
-    check_env_owner(&user.0, &env)?;
 
     let provider = env.provider.as_deref().unwrap_or("libvirt");
     if is_agent_managed(provider) {
@@ -617,11 +605,23 @@ async fn transition_state(
         )));
     }
 
-    sqlx::query("UPDATE environments SET state = ? WHERE id = ?")
+    // When transitioning to states where the VM is being (re)created or destroyed,
+    // clear stale endpoint info — the VM's IP/ports will change.
+    if matches!(new_state, "creating" | "destroying") {
+        sqlx::query(
+            "UPDATE environments SET state = ?, ssh_host = NULL, ssh_port = NULL, vnc_host = NULL, vnc_port = NULL WHERE id = ?"
+        )
         .bind(new_state)
         .bind(env_id)
         .execute(&state.db)
         .await?;
+    } else {
+        sqlx::query("UPDATE environments SET state = ? WHERE id = ?")
+            .bind(new_state)
+            .bind(env_id)
+            .execute(&state.db)
+            .await?;
+    }
 
     events::emit(
         &state.db,
@@ -821,6 +821,17 @@ async fn force_reboot(
         });
     }
 
+    Ok(env)
+}
+
+async fn restart(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(env_id): Path<String>,
+) -> Result<Json<Environment>, AppError> {
+    // Transition failed → creating; the node agent (or libvirt task spawner in create_environment)
+    // will pick up the "creating" state and re-attempt VM creation.
+    let env = transition_state(&state, &env_id, &user.0, &["failed"], "creating").await?;
     Ok(env)
 }
 

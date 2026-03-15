@@ -1,7 +1,14 @@
 import Foundation
 import Logging
 
-/// Manages TCP port forwarding from host LAN ports to VM NAT IPs via socat.
+/// Manages TCP port forwarding from host LAN ports to VM NAT IPs.
+///
+/// VMs run on bridge100 (192.168.64.x), which is not routable from the LAN.
+/// macOS 15+ Local Network Privacy blocks non-system binaries from connecting
+/// to bridge100. We work around this by:
+///   - Listening on 0.0.0.0 in the Swift process (LAN-accessible)
+///   - Spawning /usr/bin/nc (system binary, exempt from LNP) per accepted
+///     connection to relay data to the VM
 final class PortForwarder {
     private let logger = Logger(label: "orion.node-agent.port-forwarder")
 
@@ -9,8 +16,8 @@ final class PortForwarder {
         let vmIP: String
         let sshHostPort: Int
         let vncHostPort: Int
-        var sshProcess: Process?
-        var vncProcess: Process?
+        var sshListener: Task<Void, Never>?
+        var vncListener: Task<Void, Never>?
     }
 
     private var forwardings: [String: Forwarding] = [:]  // keyed by envId
@@ -19,7 +26,7 @@ final class PortForwarder {
 
     // MARK: - Host LAN IP
 
-    /// Discover the host's LAN IP address (first non-loopback IPv4).
+    /// Discover the host's LAN IP address (first non-loopback IPv4 on en*).
     static func hostLANIP() -> String? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return nil }
@@ -39,7 +46,6 @@ final class PortForwarder {
                                &hostname, socklen_t(hostname.count),
                                nil, 0, NI_NUMERICHOST) == 0 {
                     let ip = String(cString: hostname)
-                    // Prefer en0/en1 (Wi-Fi/Ethernet)
                     let name = String(cString: ifa.pointee.ifa_name)
                     if name.hasPrefix("en") {
                         return ip
@@ -70,13 +76,11 @@ final class PortForwarder {
     /// Discover a VM's NAT IP by resolving its mDNS hostname.
     func discoverVMIPByHostname(hostname: String, retries: Int = 15, interval: TimeInterval = 2) async -> String? {
         for attempt in 1...retries {
-            // Try DNS resolution of the .local hostname
             let fqdn = hostname.hasSuffix(".local") ? hostname : "\(hostname).local"
             if let ip = resolveHostname(fqdn) {
                 logger.info("resolved \(fqdn) to \(ip) (attempt \(attempt))")
                 return ip
             }
-            // Also try scanning DHCP leases by hostname
             if let ip = parseLeaseFileByName(hostname.replacingOccurrences(of: ".local", with: "")) {
                 logger.info("found \(hostname) in DHCP leases: \(ip) (attempt \(attempt))")
                 return ip
@@ -137,7 +141,6 @@ final class PortForwarder {
         guard let content = try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8) else {
             return nil
         }
-        // Parse blocks between { and }, collecting name and ip_address
         var currentIP: String?
         var currentName: String?
         for line in content.components(separatedBy: "\n") {
@@ -161,41 +164,41 @@ final class PortForwarder {
     // MARK: - Forwarding lifecycle
 
     /// Start port forwarding for an environment. Returns (sshPort, vncPort).
-    func startForwarding(envId: String, vmIP: String) throws -> (sshPort: Int, vncPort: Int) {
+    func startForwarding(envId: String, vmIP: String) -> (sshPort: Int, vncPort: Int) {
         // If already forwarding, stop first
         stopForwarding(envId: envId)
 
         let sshPort = allocatePort(starting: &nextSSHPort)
         let vncPort = allocatePort(starting: &nextVNCPort)
 
-        let sshProc = try spawnForwarder(listenPort: sshPort, targetHost: vmIP, targetPort: 22)
-        let vncProc = try spawnForwarder(listenPort: vncPort, targetHost: vmIP, targetPort: 5900)
+        let sshListener = startListener(listenPort: sshPort, targetHost: vmIP, targetPort: 22, label: "\(envId)/ssh")
+        let vncListener = startListener(listenPort: vncPort, targetHost: vmIP, targetPort: 5900, label: "\(envId)/vnc")
 
         forwardings[envId] = Forwarding(
             vmIP: vmIP,
             sshHostPort: sshPort,
             vncHostPort: vncPort,
-            sshProcess: sshProc,
-            vncProcess: vncProc
+            sshListener: sshListener,
+            vncListener: vncListener
         )
 
-        logger.info("[\(envId)] port forwarding started: SSH=\(sshPort)→\(vmIP):22, VNC=\(vncPort)→\(vmIP):5900")
+        logger.info("[\(envId)] port forwarding started: SSH=0.0.0.0:\(sshPort)→\(vmIP):22, VNC=0.0.0.0:\(vncPort)→\(vmIP):5900")
         return (sshPort, vncPort)
     }
 
     /// Stop port forwarding for an environment.
     func stopForwarding(envId: String) {
         guard let fwd = forwardings.removeValue(forKey: envId) else { return }
-        fwd.sshProcess?.terminate()
-        fwd.vncProcess?.terminate()
+        fwd.sshListener?.cancel()
+        fwd.vncListener?.cancel()
         logger.info("[\(envId)] port forwarding stopped")
     }
 
     /// Stop all active forwardings (for cleanup on shutdown).
     func stopAll() {
         for (envId, fwd) in forwardings {
-            fwd.sshProcess?.terminate()
-            fwd.vncProcess?.terminate()
+            fwd.sshListener?.cancel()
+            fwd.vncListener?.cancel()
             logger.info("[\(envId)] port forwarding stopped (shutdown)")
         }
         forwardings.removeAll()
@@ -206,47 +209,173 @@ final class PortForwarder {
         return forwardings[envId] != nil
     }
 
-    // MARK: - Internals
+    // MARK: - TCP Listener + nc bridge
 
-    private func spawnForwarder(listenPort: Int, targetHost: String, targetPort: Int) throws -> Process {
-        let script = """
-        import socket, threading, sys, signal
-        signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
-        def forward(src, dst):
-            try:
-                while True:
-                    d = src.recv(65536)
-                    if not d: break
-                    dst.sendall(d)
-            except: pass
-            finally: src.close(); dst.close()
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(('0.0.0.0', \(listenPort)))
-        srv.listen(128)
-        while True:
-            c, _ = srv.accept()
-            try:
-                r = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                r.settimeout(10)
-                r.connect(('\(targetHost)', \(targetPort)))
-                r.settimeout(None)
-                threading.Thread(target=forward, args=(c, r), daemon=True).start()
-                threading.Thread(target=forward, args=(r, c), daemon=True).start()
-            except: c.close()
-        """
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = ["-c", script]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        return process
+    /// Start a TCP listener on 0.0.0.0:listenPort.
+    /// For each accepted connection, spawn /usr/bin/nc to relay to targetHost:targetPort.
+    private func startListener(listenPort: Int, targetHost: String, targetPort: Int, label: String) -> Task<Void, Never> {
+        let logger = self.logger
+        return Task.detached {
+            let serverFD = socket(AF_INET, SOCK_STREAM, 0)
+            guard serverFD >= 0 else {
+                logger.error("[\(label)] failed to create server socket")
+                return
+            }
+
+            var reuseAddr: Int32 = 1
+            setsockopt(serverFD, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, socklen_t(MemoryLayout<Int32>.size))
+
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = UInt16(listenPort).bigEndian
+            addr.sin_addr.s_addr = INADDR_ANY
+
+            let bindResult = withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                    bind(serverFD, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard bindResult == 0 else {
+                logger.error("[\(label)] bind failed on port \(listenPort): errno \(errno)")
+                close(serverFD)
+                return
+            }
+
+            guard listen(serverFD, 16) == 0 else {
+                logger.error("[\(label)] listen failed: errno \(errno)")
+                close(serverFD)
+                return
+            }
+
+            logger.info("[\(label)] listening on 0.0.0.0:\(listenPort)")
+
+            while !Task.isCancelled {
+                var clientAddr = sockaddr_in()
+                var clientAddrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let clientFD = withUnsafeMutablePointer(to: &clientAddr) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                        accept(serverFD, sockPtr, &clientAddrLen)
+                    }
+                }
+
+                if clientFD < 0 {
+                    if Task.isCancelled { break }
+                    continue
+                }
+
+                // Handle each connection in a detached task
+                let tHost = targetHost
+                let tPort = targetPort
+                let connLabel = label
+                Task.detached {
+                    await Self.handleConnection(clientFD: clientFD, targetHost: tHost, targetPort: tPort, label: connLabel, logger: logger)
+                }
+            }
+
+            close(serverFD)
+            logger.info("[\(label)] listener stopped")
+        }
     }
 
+    /// Handle a single client connection by spawning /usr/bin/nc to the target.
+    private static func handleConnection(clientFD: Int32, targetHost: String, targetPort: Int, label: String, logger: Logger) async {
+        // Spawn /usr/bin/nc to connect to the VM (system binary, bypasses Local Network Privacy)
+        let ncProcess = Process()
+        ncProcess.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
+        ncProcess.arguments = [targetHost, String(targetPort)]
+
+        let ncStdinPipe = Pipe()
+        let ncStdoutPipe = Pipe()
+        ncProcess.standardInput = ncStdinPipe
+        ncProcess.standardOutput = ncStdoutPipe
+        ncProcess.standardError = FileHandle.nullDevice
+
+        do {
+            try ncProcess.run()
+        } catch {
+            logger.error("[\(label)] failed to spawn nc: \(error)")
+            close(clientFD)
+            return
+        }
+
+        let ncStdinHandle = ncStdinPipe.fileHandleForWriting
+        let ncStdoutHandle = ncStdoutPipe.fileHandleForReading
+
+        // Bidirectional relay: client ↔ nc
+        // Direction 1: client socket → nc stdin
+        let clientToNC = Task.detached {
+            let bufSize = 65536
+            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: bufSize)
+            defer { buf.deallocate() }
+
+            while true {
+                let bytesRead = read(clientFD, buf, bufSize)
+                if bytesRead <= 0 { break }
+                let data = Data(bytes: buf, count: bytesRead)
+                do {
+                    try ncStdinHandle.write(contentsOf: data)
+                } catch {
+                    break
+                }
+            }
+            try? ncStdinHandle.close()
+        }
+
+        // Direction 2: nc stdout → client socket
+        let ncToClient = Task.detached {
+            let bufSize = 65536
+            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: bufSize)
+            defer { buf.deallocate() }
+
+            let fd = ncStdoutHandle.fileDescriptor
+            while true {
+                let bytesRead = read(fd, buf, bufSize)
+                if bytesRead <= 0 { break }
+                var totalWritten = 0
+                while totalWritten < bytesRead {
+                    let written = write(clientFD, buf.advanced(by: totalWritten), bytesRead - totalWritten)
+                    if written <= 0 { return }
+                    totalWritten += written
+                }
+            }
+        }
+
+        // Wait for either direction to finish
+        _ = await clientToNC.value
+        _ = await ncToClient.value
+
+        // Cleanup
+        close(clientFD)
+        if ncProcess.isRunning {
+            ncProcess.terminate()
+        }
+    }
+
+    // MARK: - Helpers
+
     private func allocatePort(starting: inout Int) -> Int {
-        let port = starting
-        starting += 1
-        return port
+        while true {
+            let port = starting
+            starting += 1
+            if starting > 65000 { starting = 10000 }
+            if isPortAvailable(port) { return port }
+        }
+    }
+
+    private func isPortAvailable(_ port: Int) -> Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { close(sock) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_addr.s_addr = INADDR_ANY
+        var reuseAddr: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, socklen_t(MemoryLayout<Int32>.size))
+        return withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
     }
 }

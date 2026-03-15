@@ -29,10 +29,7 @@ import type {
 } from "./types";
 
 const BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "") ||
-  (typeof window !== "undefined"
-    ? `${window.location.protocol}//${window.location.hostname}:3000`
-    : "http://localhost:3000");
+  process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "") || "";
 
 // ── Internal helpers ───────────────────────────────────────────────
 
@@ -41,7 +38,14 @@ class ApiError extends Error {
     public status: number,
     public body: string,
   ) {
-    super(`API error ${status}: ${body}`);
+    let message: string;
+    try {
+      const parsed = JSON.parse(body);
+      message = parsed.error || body;
+    } catch {
+      message = body;
+    }
+    super(message);
     this.name = "ApiError";
   }
 }
@@ -161,7 +165,7 @@ export async function webauthnLoginComplete(body: {
 // ── TOTP (fallback) ──────────────────────────────────────────────
 
 export async function totpRegister(body: {
-  email: string;
+  username: string;
   display_name?: string;
 }): Promise<{ challenge_id: string; otpauth_url: string; secret: string }> {
   return request("/v1/auth/totp/register", {
@@ -181,7 +185,6 @@ export async function totpVerify(body: {
 }
 
 export async function totpLogin(body: {
-  email: string;
   code: string;
 }): Promise<LoginResponse> {
   return request("/v1/auth/totp/login", {
@@ -374,6 +377,12 @@ export async function forceRebootEnvironment(
   });
 }
 
+export async function restartEnvironment(envId: string): Promise<Environment> {
+  return request<Environment>(`/v1/environments/${envId}/restart`, {
+    method: "POST",
+  });
+}
+
 export async function migrateEnvironment(
   envId: string,
   body: MigrateRequest,
@@ -521,6 +530,7 @@ export const api = {
   resumeEnvironment,
   rebootEnvironment,
   forceRebootEnvironment,
+  restartEnvironment,
   migrateEnvironment,
   togglePortForwarding,
   extendEnvironmentTtl,

@@ -33,11 +33,9 @@ pub fn routes() -> Router<AppState> {
 
 async fn list_snapshots(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Path(env_id): Path<String>,
 ) -> Result<Json<Vec<Snapshot>>, AppError> {
-    let env = fetch_env(&state, &env_id).await?;
-    check_env_owner(&user.0, &env)?;
 
     let snapshots = sqlx::query_as::<_, Snapshot>("SELECT * FROM snapshots WHERE env_id = ?")
         .bind(&env_id)

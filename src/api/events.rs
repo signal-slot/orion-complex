@@ -8,7 +8,7 @@ use crate::auth::AuthUser;
 use crate::error::AppError;
 use crate::models::EnvironmentEvent;
 
-use super::{PaginationParams, check_env_owner, fetch_env};
+use super::PaginationParams;
 
 pub fn routes() -> Router<AppState> {
     Router::new().route(
@@ -19,12 +19,10 @@ pub fn routes() -> Router<AppState> {
 
 async fn list_events(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Path(env_id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<EnvironmentEvent>>, AppError> {
-    let env = fetch_env(&state, &env_id).await?;
-    check_env_owner(&user.0, &env)?;
 
     let events = sqlx::query_as::<_, EnvironmentEvent>(
         "SELECT * FROM environment_events WHERE env_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",

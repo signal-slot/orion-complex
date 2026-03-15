@@ -8,7 +8,7 @@ use crate::auth::AuthUser;
 use crate::error::AppError;
 use crate::models::Task;
 
-use super::{PaginationParams, check_env_owner, fetch_env};
+use super::PaginationParams;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -49,12 +49,10 @@ async fn get_task(
 
 async fn list_tasks_for_env(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     Path(env_id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<Task>>, AppError> {
-    let env = fetch_env(&state, &env_id).await?;
-    check_env_owner(&user.0, &env)?;
 
     let tasks = sqlx::query_as::<_, Task>(
         "SELECT * FROM tasks WHERE env_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",

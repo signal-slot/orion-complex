@@ -24,6 +24,7 @@ final class VMManager {
         let bundlePath: String
         let monitorSocketPath: String
         let sshHostPort: Int
+        let vncHostPort: Int
     }
 
     init(bundleStorePath: String) {
@@ -53,6 +54,11 @@ final class VMManager {
     /// Get the SSH host port for a QEMU VM (QEMU handles its own port forwarding).
     func qemuSSHPort(envId: String) -> Int? {
         return qemuVMs[envId]?.sshHostPort
+    }
+
+    /// Get the VNC host port for a QEMU VM.
+    func qemuVNCPort(envId: String) -> Int? {
+        return qemuVMs[envId]?.vncHostPort
     }
 
     // MARK: - VM lifecycle
@@ -138,9 +144,19 @@ final class VMManager {
         )
         config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)]
 
-        // Network (NAT)
+        // Network (NAT) — persist MAC address so DHCP lease survives VM restarts
         let networkConfig = VZVirtioNetworkDeviceConfiguration()
         networkConfig.attachment = VZNATNetworkDeviceAttachment()
+        let macFilePath = "\(bundlePath)/mac-address"
+        if let savedMAC = try? String(contentsOfFile: macFilePath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           let mac = VZMACAddress(string: savedMAC) {
+            networkConfig.macAddress = mac
+            logger.info("using saved MAC address: \(savedMAC)")
+        } else {
+            let newMAC = networkConfig.macAddress.string
+            try? newMAC.write(toFile: macFilePath, atomically: true, encoding: .utf8)
+            logger.info("generated new MAC address: \(newMAC)")
+        }
         let macMAC = networkConfig.macAddress.string
         config.networkDevices = [networkConfig]
 
@@ -235,9 +251,19 @@ final class VMManager {
         )
         config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)]
 
-        // Network (NAT)
+        // Network (NAT) — persist MAC address so DHCP lease survives VM restarts
         let networkConfig = VZVirtioNetworkDeviceConfiguration()
         networkConfig.attachment = VZNATNetworkDeviceAttachment()
+        let macFilePath = "\(bundlePath)/mac-address"
+        if let savedMAC = try? String(contentsOfFile: macFilePath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           let mac = VZMACAddress(string: savedMAC) {
+            networkConfig.macAddress = mac
+            logger.info("using saved MAC address: \(savedMAC)")
+        } else {
+            let newMAC = networkConfig.macAddress.string
+            try? newMAC.write(toFile: macFilePath, atomically: true, encoding: .utf8)
+            logger.info("generated new MAC address: \(newMAC)")
+        }
         let linuxMAC = networkConfig.macAddress.string
         config.networkDevices = [networkConfig]
 
@@ -281,6 +307,8 @@ final class VMManager {
 
     /// Next available host port for QEMU SSH forwarding.
     private static var nextQEMUSSHPort = 12022
+    /// Next available host port for QEMU VNC.
+    private static var nextQEMUVNCPort = 15950
 
     private func createQEMUVM(envId: String, cpuCount: Int, memoryGB: Int) async throws {
         logger.info("creating QEMU x86-64 VM for environment \(envId)")
@@ -298,9 +326,11 @@ final class VMManager {
             throw VMError.diskCreationFailed(diskPath)
         }
 
-        // Allocate host port for SSH forwarding
+        // Allocate host ports for SSH and VNC forwarding
         let sshPort = VMManager.nextQEMUSSHPort
         VMManager.nextQEMUSSHPort += 1
+        let vncPort = VMManager.nextQEMUVNCPort
+        VMManager.nextQEMUVNCPort += 1
 
         // Build cloud-init ISO if seed files exist
         let ciISOPath = "\(bundlePath)/cidata.iso"
@@ -349,6 +379,8 @@ final class VMManager {
             "-netdev", "user,id=net0,hostfwd=tcp::\(sshPort)-:22",
             "-device", "virtio-net-pci,netdev=net0",
             "-display", "none",
+            "-vnc", "127.0.0.1:\(vncPort - 5900)",
+            "-device", "virtio-gpu-pci",
             "-serial", "mon:stdio",
             "-monitor", "unix:\(monitorSocket),server,nowait",
             "-device", "virtio-rng-pci",
@@ -382,10 +414,11 @@ final class VMManager {
             process: process,
             bundlePath: bundlePath,
             monitorSocketPath: monitorSocket,
-            sshHostPort: sshPort
+            sshHostPort: sshPort,
+            vncHostPort: vncPort
         )
 
-        logger.info("QEMU x86-64 VM started for environment \(envId) (SSH port \(sshPort))")
+        logger.info("QEMU x86-64 VM started for environment \(envId) (SSH port \(sshPort), VNC port \(vncPort))")
     }
 
     /// Build a cloud-init NoCloud ISO from meta-data and user-data files.

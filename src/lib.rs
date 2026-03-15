@@ -7,6 +7,7 @@ pub mod error;
 pub mod events;
 pub mod models;
 pub mod tasks;
+pub mod tls;
 pub mod vm;
 
 use std::sync::Arc;

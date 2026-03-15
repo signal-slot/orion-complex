@@ -10,6 +10,19 @@ use crate::auth::create_session_token;
 use crate::error::AppError;
 use crate::models::User;
 
+/// Verify a TOTP code against a secret, checking ±3 time steps (±90 seconds).
+/// Uses manual generate+compare because totp_rs::check_current() is unreliable.
+fn verify_totp_code(totp: &totp_rs::TOTP, code: &str) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    (-3i64..=3).any(|offset| {
+        let t = (now as i64 + offset * 30) as u64;
+        totp.generate(t) == code
+    })
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/auth/webauthn/register/begin", post(register_begin))
@@ -369,7 +382,7 @@ async fn login_complete(
 
 #[derive(Debug, Deserialize)]
 struct TotpRegisterRequest {
-    email: String,
+    username: String,
     display_name: Option<String>,
 }
 
@@ -377,24 +390,14 @@ async fn totp_register(
     State(state): State<AppState>,
     Json(req): Json<TotpRegisterRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let email = req.email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err(AppError::BadRequest("invalid email".into()));
+    let username = req.username.trim().to_lowercase();
+    if username.is_empty() {
+        return Err(AppError::BadRequest("username is required".into()));
     }
 
-    // Check allowed domains
-    let email_domain = email.split('@').nth(1).unwrap_or("").to_string();
-    if !state.auth_config.allowed_domains.is_empty()
-        && !state.auth_config.allowed_domains.contains(&email_domain)
-    {
-        return Err(AppError::BadRequest(format!(
-            "domain '{email_domain}' is not allowed"
-        )));
-    }
-
-    // Check if user already has TOTP set up
-    let existing = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = ?")
-        .bind(&email)
+    // Check if user already has TOTP set up (look up by display_name as username)
+    let existing = sqlx::query_as::<_, User>("SELECT * FROM users WHERE display_name = ?")
+        .bind(&username)
         .fetch_optional(&state.db)
         .await?;
 
@@ -415,7 +418,7 @@ async fn totp_register(
         30,
         secret.to_bytes().map_err(|e| AppError::Internal(format!("secret error: {e}")))?,
         Some("Orion Complex".to_string()),
-        email.clone(),
+        username.clone(),
     )
     .map_err(|e| AppError::Internal(format!("totp error: {e}")))?;
 
@@ -426,6 +429,8 @@ async fn totp_register(
     let challenge_id = uuid::Uuid::new_v4().to_string();
     let now = crate::unix_now();
 
+    let display_name = req.display_name.as_deref().unwrap_or(&username);
+
     sqlx::query(
         "INSERT INTO webauthn_challenges (id, challenge_type, state_json, user_id, email, display_name, created_at, expires_at)
          VALUES (?, 'totp_register', ?, ?, ?, ?, ?, ?)",
@@ -433,8 +438,8 @@ async fn totp_register(
     .bind(&challenge_id)
     .bind(&secret_base32)
     .bind(existing.as_ref().map(|u| &u.id))
-    .bind(&email)
-    .bind(req.display_name.as_deref().unwrap_or(""))
+    .bind(&username) // store username in email column for now
+    .bind(display_name)
     .bind(now)
     .bind(now + 600) // 10 minutes to scan QR
     .execute(&state.db)
@@ -484,7 +489,7 @@ async fn totp_verify(
     )
     .map_err(|e| AppError::Internal(format!("totp error: {e}")))?;
 
-    if !totp.check_current(&req.code).map_err(|e| AppError::Internal(format!("time error: {e}")))? {
+    if !verify_totp_code(&totp, &req.code) {
         return Err(AppError::BadRequest("incorrect code — try again".into()));
     }
 
@@ -495,6 +500,7 @@ async fn totp_verify(
         .await?;
 
     // Get or create user, store TOTP secret
+    let username = challenge.email.as_deref().unwrap_or("");
     let user = if let Some(user_id) = &challenge.user_id {
         sqlx::query("UPDATE users SET totp_secret = ? WHERE id = ?")
             .bind(secret_base32)
@@ -512,17 +518,15 @@ async fn totp_verify(
         let role = if user_count.0 == 0 { "admin" } else { "user" };
 
         let user_id = uuid::Uuid::new_v4().to_string();
-        let email_domain = email.split('@').nth(1).unwrap_or("");
-        let display_name = challenge.display_name.as_deref().unwrap_or("");
+        let display_name = challenge.display_name.as_deref().unwrap_or(username);
 
         sqlx::query(
             "INSERT INTO users (id, provider, provider_subject, email, email_domain, display_name, role, disabled, totp_secret, created_at)
-             VALUES (?, 'totp', ?, ?, ?, ?, ?, 0, ?, ?)",
+             VALUES (?, 'totp', ?, ?, '', ?, ?, 0, ?, ?)",
         )
         .bind(&user_id)
         .bind(&user_id)
-        .bind(email)
-        .bind(email_domain)
+        .bind(username)
         .bind(display_name)
         .bind(role)
         .bind(secret_base32)
@@ -551,7 +555,6 @@ async fn totp_verify(
 
 #[derive(Debug, Deserialize)]
 struct TotpLoginRequest {
-    email: String,
     code: String,
 }
 
@@ -559,46 +562,53 @@ async fn totp_login(
     State(state): State<AppState>,
     Json(req): Json<TotpLoginRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let email = req.email.trim().to_lowercase();
-
-    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = ?")
-        .bind(&email)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::BadRequest("no account found for this email".into()))?;
-
-    if user.disabled != 0 {
-        return Err(AppError::BadRequest("user is disabled".into()));
+    let code = req.code.trim();
+    if code.len() != 6 {
+        return Err(AppError::BadRequest("code must be 6 digits".into()));
     }
 
-    let secret_base32 = user
-        .totp_secret
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("no TOTP configured for this account".into()))?;
-
-    let secret = totp_rs::Secret::Encoded(secret_base32.to_string());
-    let totp = totp_rs::TOTP::new(
-        totp_rs::Algorithm::SHA1,
-        6,
-        1,
-        30,
-        secret.to_bytes().map_err(|e| AppError::Internal(format!("secret error: {e}")))?,
-        Some("Orion Complex".to_string()),
-        email.clone(),
+    // Fetch all users with TOTP configured and find the matching one
+    let users = sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE totp_secret IS NOT NULL AND disabled = 0",
     )
-    .map_err(|e| AppError::Internal(format!("totp error: {e}")))?;
+    .fetch_all(&state.db)
+    .await?;
 
-    if !totp.check_current(&req.code).map_err(|e| AppError::Internal(format!("time error: {e}")))? {
-        return Err(AppError::BadRequest("incorrect code".into()));
+    for user in &users {
+        let secret_base32 = match user.totp_secret.as_deref() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let secret = totp_rs::Secret::Encoded(secret_base32.to_string());
+        let totp = match totp_rs::TOTP::new(
+            totp_rs::Algorithm::SHA1,
+            6,
+            3,
+            30,
+            match secret.to_bytes() {
+                Ok(b) => b,
+                Err(_) => continue,
+            },
+            Some("Orion Complex".to_string()),
+            user.display_name.clone().unwrap_or_default(),
+        ) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        if verify_totp_code(&totp, code) {
+            let token = create_session_token(&state.auth_config, &user.id)
+                .map_err(|e| AppError::Internal(format!("token error: {e}")))?;
+
+            return Ok(Json(serde_json::json!({
+                "token": token,
+                "user": user,
+            })));
+        }
     }
 
-    let token = create_session_token(&state.auth_config, &user.id)
-        .map_err(|e| AppError::Internal(format!("token error: {e}")))?;
-
-    Ok(Json(serde_json::json!({
-        "token": token,
-        "user": user,
-    })))
+    Err(AppError::BadRequest("incorrect code".into()))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

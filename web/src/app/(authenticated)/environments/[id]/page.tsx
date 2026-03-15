@@ -79,6 +79,9 @@ export default function EnvironmentDetailPage() {
         case "reboot":
           await api.rebootEnvironment(envId);
           break;
+        case "restart":
+          await api.restartEnvironment(envId);
+          break;
         case "destroy":
           await api.destroyEnvironment(envId);
           setShowDestroyModal(false);
@@ -221,6 +224,34 @@ export default function EnvironmentDetailPage() {
             )}
           </div>
           <div className="space-y-3">
+            {/* Browser-based access */}
+            <div className="flex gap-3">
+              <a
+                href={`/environments/${env.id}/ssh`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-1 rounded-lg bg-green-700 px-4 py-2.5 text-sm font-medium text-white text-center hover:bg-green-600 transition-colors"
+              >
+                Open SSH Terminal
+              </a>
+              {env.guest_os === "macos" && env.vnc_host ? (
+                <a
+                  href={`vnc://${env.vnc_host}:${env.vnc_port || 5900}`}
+                  className="flex-1 rounded-lg bg-blue-700 px-4 py-2.5 text-sm font-medium text-white text-center hover:bg-blue-600 transition-colors"
+                >
+                  Screen Sharing
+                </a>
+              ) : env.guest_os !== "macos" ? (
+                <a
+                  href={`/environments/${env.id}/vnc`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex-1 rounded-lg bg-blue-700 px-4 py-2.5 text-sm font-medium text-white text-center hover:bg-blue-600 transition-colors"
+                >
+                  Open VNC
+                </a>
+              ) : null}
+            </div>
             {/* Local access (mDNS) */}
             {sshEndpoint && !env.port_forwarding && (() => {
               const vmHost = `orion-${env.id.slice(0, 8)}.local`;
@@ -322,6 +353,14 @@ export default function EnvironmentDetailPage() {
               label="Resume"
               onClick={() => handleAction("resume")}
               loading={actionLoading === "resume"}
+              className="border-green-700 text-green-400 hover:bg-green-900/30"
+            />
+          )}
+          {state === "failed" && (
+            <ActionButton
+              label="Restart"
+              onClick={() => handleAction("restart")}
+              loading={actionLoading === "restart"}
               className="border-green-700 text-green-400 hover:bg-green-900/30"
             />
           )}

@@ -551,31 +551,105 @@ async fn test_owner_scoped_environments() {
     assert_eq!(status, StatusCode::CREATED);
     let user_env_id = user_env["id"].as_str().unwrap().to_string();
 
-    // Regular user lists environments — should only see their own
+    // All users see all environments (shared resource visibility)
     let (_, envs) = helpers::get(&app, "/v1/environments", &user_token).await;
-    let envs = envs.as_array().unwrap();
-    assert_eq!(envs.len(), 1);
-    assert_eq!(envs[0]["id"], user_env_id);
+    assert_eq!(envs.as_array().unwrap().len(), 2);
 
-    // Admin lists environments — should see all
     let (_, envs) = helpers::get(&app, "/v1/environments", &admin_token).await;
     assert_eq!(envs.as_array().unwrap().len(), 2);
 
-    // Regular user can get their own environment
+    // Regular user can view any environment
     let (status, _) = helpers::get(&app, &format!("/v1/environments/{user_env_id}"), &user_token).await;
     assert_eq!(status, StatusCode::OK);
 
-    // Regular user cannot get admin's environment (returns 404)
     let (status, _) = helpers::get(&app, &format!("/v1/environments/{admin_env_id}"), &user_token).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::OK);
 
-    // Regular user cannot destroy admin's environment
+    // Shared resource system: any user can destroy any environment
     let status = helpers::delete(&app, &format!("/v1/environments/{admin_env_id}"), &user_token).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
-    // Regular user can destroy their own environment
     let status = helpers::delete(&app, &format!("/v1/environments/{user_env_id}"), &user_token).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+// ---- Environment restart ----
+
+#[tokio::test]
+async fn test_restart_clears_endpoints() {
+    let (app, token) = helpers::setup().await;
+
+    // Setup: create node and image
+    helpers::post(&app, "/v1/nodes", &token, json!({
+        "name": "node-1", "host_os": "linux", "host_arch": "x86_64",
+        "cpu_cores": 8, "memory_bytes": 17179869184_i64, "disk_bytes_total": 536870912000_i64
+    })).await;
+    let (_, image) = helpers::post(&app, "/v1/images", &token, json!({
+        "name": "test-image", "provider": "libvirt", "guest_os": "linux", "guest_arch": "x86_64"
+    })).await;
+
+    // Create environment (StubProvider sets it to running immediately)
+    let (status, env) = helpers::post(&app, "/v1/environments", &token, json!({
+        "image_id": image["id"]
+    })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let env_id = env["id"].as_str().unwrap();
+
+    // Wait for stub provider to finish creating
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Set fake endpoints via the endpoints API
+    let (status, _) = helpers::put(&app, &format!("/v1/environments/{env_id}/endpoints"), &token, json!({
+        "ssh_host": "10.0.0.1", "ssh_port": 22, "vnc_host": "10.0.0.1", "vnc_port": 5900
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Verify endpoints are set
+    let (_, env_data) = helpers::get(&app, &format!("/v1/environments/{env_id}"), &token).await;
+    assert_eq!(env_data["vnc_host"].as_str(), Some("10.0.0.1"));
+    assert_eq!(env_data["vnc_port"].as_i64(), Some(5900));
+
+    // Simulate failure: force state to "failed"
+    let (status, _) = helpers::put(&app, &format!("/v1/environments/{env_id}/state"), &token, json!({
+        "state": "failed"
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Restart: failed → creating
+    let (status, restarted) = helpers::post(&app, &format!("/v1/environments/{env_id}/restart"), &token, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(restarted["state"].as_str(), Some("creating"));
+
+    // Endpoints must be cleared
+    assert!(restarted["vnc_host"].is_null(), "vnc_host should be cleared after restart");
+    assert!(restarted["vnc_port"].is_null(), "vnc_port should be cleared after restart");
+    assert!(restarted["ssh_host"].is_null(), "ssh_host should be cleared after restart");
+    assert!(restarted["ssh_port"].is_null(), "ssh_port should be cleared after restart");
+}
+
+#[tokio::test]
+async fn test_restart_only_from_failed() {
+    let (app, token) = helpers::setup().await;
+
+    // Setup
+    helpers::post(&app, "/v1/nodes", &token, json!({
+        "name": "node-1", "host_os": "linux", "host_arch": "x86_64",
+        "cpu_cores": 8, "memory_bytes": 17179869184_i64, "disk_bytes_total": 536870912000_i64
+    })).await;
+    let (_, image) = helpers::post(&app, "/v1/images", &token, json!({
+        "name": "test-image", "provider": "libvirt", "guest_os": "linux", "guest_arch": "x86_64"
+    })).await;
+
+    let (_, env) = helpers::post(&app, "/v1/environments", &token, json!({
+        "image_id": image["id"]
+    })).await;
+    let env_id = env["id"].as_str().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Running → restart should fail
+    let (status, body) = helpers::post(&app, &format!("/v1/environments/{env_id}/restart"), &token, json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("cannot transition"));
 }
 
 // ---- Environment TTL / expiration ----
@@ -1157,4 +1231,167 @@ async fn test_environment_tasks() {
     // Global tasks list should have both
     let (_, all_tasks) = helpers::get(&app, "/v1/tasks", &token).await;
     assert!(all_tasks.as_array().unwrap().len() >= 2);
+}
+
+// ---- TOTP Authentication ----
+
+#[tokio::test]
+async fn test_totp_register_verify_login() {
+    let (app, _admin_token) = helpers::setup().await;
+
+    // Step 1: Register — get challenge + secret
+    let (status, body) = helpers::post(
+        &app,
+        "/v1/auth/totp/register",
+        "", // no auth needed
+        json!({ "username": "alice" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "register failed: {body}");
+    let challenge_id = body["challenge_id"].as_str().unwrap();
+    let secret_base32 = body["secret"].as_str().unwrap();
+    assert!(body["otpauth_url"].as_str().unwrap().starts_with("otpauth://totp/"));
+
+    // Step 2: Generate valid code from the secret
+    let secret = totp_rs::Secret::Encoded(secret_base32.to_string());
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        3,
+        30,
+        secret.to_bytes().unwrap(),
+        Some("Orion Complex".to_string()),
+        "alice".to_string(),
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let code = totp.generate(now);
+
+    // Step 3: Verify — complete registration
+    let (status, body) = helpers::post(
+        &app,
+        "/v1/auth/totp/verify",
+        "",
+        json!({ "challenge_id": challenge_id, "code": code }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "verify failed: {body}");
+    assert!(body["token"].as_str().is_some(), "no token in verify response");
+    assert!(body["user"]["id"].as_str().is_some(), "no user in verify response");
+
+    // Step 4: Login with a fresh code
+    let code = totp.generate(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    let (status, body) = helpers::post(
+        &app,
+        "/v1/auth/totp/login",
+        "",
+        json!({ "code": code }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "login failed: {body}");
+    assert!(body["token"].as_str().is_some(), "no token in login response");
+
+    // Step 5: Login with wrong code should fail
+    let (status, body) = helpers::post(
+        &app,
+        "/v1/auth/totp/login",
+        "",
+        json!({ "code": "000000" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"].as_str().unwrap(), "incorrect code");
+}
+
+#[tokio::test]
+async fn test_totp_register_duplicate_username() {
+    let (app, _admin_token) = helpers::setup().await;
+
+    // Register alice
+    let (status, body) = helpers::post(
+        &app,
+        "/v1/auth/totp/register",
+        "",
+        json!({ "username": "bob" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge_id = body["challenge_id"].as_str().unwrap();
+    let secret_base32 = body["secret"].as_str().unwrap();
+
+    // Complete registration
+    let secret = totp_rs::Secret::Encoded(secret_base32.to_string());
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1, 6, 3, 30,
+        secret.to_bytes().unwrap(),
+        Some("Orion Complex".to_string()), "bob".to_string(),
+    ).unwrap();
+    let code = totp.generate(
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    );
+    let (status, _) = helpers::post(
+        &app, "/v1/auth/totp/verify", "",
+        json!({ "challenge_id": challenge_id, "code": code }),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Try to register same username again — should fail
+    let (status, body) = helpers::post(
+        &app,
+        "/v1/auth/totp/register",
+        "",
+        json!({ "username": "bob" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("already exists"));
+}
+
+#[tokio::test]
+async fn test_totp_verify_wrong_code() {
+    let (app, _admin_token) = helpers::setup().await;
+
+    let (_, body) = helpers::post(
+        &app,
+        "/v1/auth/totp/register",
+        "",
+        json!({ "username": "charlie" }),
+    )
+    .await;
+    let challenge_id = body["challenge_id"].as_str().unwrap();
+
+    // Verify with wrong code
+    let (status, body) = helpers::post(
+        &app,
+        "/v1/auth/totp/verify",
+        "",
+        json!({ "challenge_id": challenge_id, "code": "999999" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("incorrect code"));
+}
+
+#[tokio::test]
+async fn test_totp_login_no_users() {
+    let (app, _admin_token) = helpers::setup().await;
+
+    // Login when no TOTP users exist — should fail gracefully
+    let (status, body) = helpers::post(
+        &app,
+        "/v1/auth/totp/login",
+        "",
+        json!({ "code": "123456" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"].as_str().unwrap(), "incorrect code");
 }

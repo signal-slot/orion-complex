@@ -5,6 +5,10 @@
 macos-agent/.build/
 macos-agent/Package.resolved
 
+# TLS
+tls-cert.pem
+tls-key.pem
+
 # Next.js
 web/.next/
 web/node_modules/

@@ -91,22 +91,31 @@ async fn main() {
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind(config.listen_addr)
-        .await
-        .expect("failed to bind listener");
-
-    tracing::info!("listening on {}", config.listen_addr);
-
     let shutdown_signal = async move {
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("received shutdown signal, draining connections...");
         let _ = shutdown_tx.send(true);
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await
-        .expect("server error");
+    // Resolve TLS config (auto-generates self-signed cert if needed)
+    let tls_config = orion_complex::tls::resolve_tls_config(&config).await;
+
+    if let Some(tls) = tls_config {
+        tracing::info!("listening on https://{}", config.listen_addr);
+        axum_server::bind_rustls(config.listen_addr, tls)
+            .serve(app.into_make_service())
+            .await
+            .expect("server error");
+    } else {
+        tracing::info!("listening on http://{} (TLS disabled)", config.listen_addr);
+        let listener = tokio::net::TcpListener::bind(config.listen_addr)
+            .await
+            .expect("failed to bind listener");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal)
+            .await
+            .expect("server error");
+    }
 
     tracing::info!("server shut down cleanly");
 }

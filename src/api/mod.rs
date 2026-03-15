@@ -10,6 +10,7 @@ pub mod ssh_keys;
 pub mod tasks;
 pub mod users;
 pub mod webauthn;
+pub mod ws;
 
 use axum::Router;
 use serde::Deserialize;
@@ -32,6 +33,7 @@ pub fn router() -> Router<AppState> {
         .merge(tasks::routes())
         .merge(events::routes())
         .merge(webauthn::routes())
+        .merge(ws::routes())
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,15 +59,7 @@ pub async fn fetch_env(state: &AppState, env_id: &str) -> Result<Environment, Ap
         .ok_or_else(|| AppError::NotFound(format!("environment {env_id} not found")))
 }
 
-pub fn check_env_owner(user: &crate::models::User, env: &Environment) -> Result<(), AppError> {
-    if user.role.as_deref() == Some("admin") {
-        return Ok(());
-    }
-    if env.owner_user_id.as_deref() == Some(&user.id) {
-        return Ok(());
-    }
-    Err(AppError::NotFound(format!(
-        "environment {} not found",
-        env.id
-    )))
+/// Shared-resource system: all authenticated users can see and operate all environments.
+pub fn check_env_owner(_user: &crate::models::User, _env: &Environment) -> Result<(), AppError> {
+    Ok(())
 }

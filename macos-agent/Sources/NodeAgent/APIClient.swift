@@ -52,6 +52,10 @@ actor APIClient {
         let created_at: Int64?
         let expires_at: Int64?
         let port_forwarding: Int?
+        let ssh_host: String?
+        let ssh_port: Int?
+        let vnc_host: String?
+        let vnc_port: Int?
     }
 
     func listEnvironments() async throws -> [Environment] {

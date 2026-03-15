@@ -11,12 +11,18 @@ pub struct Config {
     pub reaper_interval_secs: u64,
     pub heartbeat_check_interval_secs: u64,
     pub heartbeat_stale_threshold_secs: i64,
+    /// Path to TLS certificate file (PEM). If unset, auto-generates a self-signed cert.
+    pub tls_cert: Option<String>,
+    /// Path to TLS private key file (PEM). If unset, auto-generates a self-signed key.
+    pub tls_key: Option<String>,
+    /// Set to "false" or "0" to disable TLS entirely (plain HTTP).
+    pub tls_enabled: bool,
 }
 
 impl Config {
     pub fn from_env() -> Self {
         let listen_addr = env::var("LISTEN_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:3000".into())
+            .unwrap_or_else(|_| "127.0.0.1:2743".into())
             .parse()
             .expect("invalid LISTEN_ADDR");
 
@@ -51,6 +57,12 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(90);
 
+        let tls_cert = env::var("TLS_CERT").ok();
+        let tls_key = env::var("TLS_KEY").ok();
+        let tls_enabled = env::var("TLS_ENABLED")
+            .map(|v| !matches!(v.as_str(), "false" | "0" | "no"))
+            .unwrap_or(true); // TLS on by default
+
         Self {
             listen_addr,
             database_url,
@@ -60,6 +72,9 @@ impl Config {
             reaper_interval_secs,
             heartbeat_check_interval_secs,
             heartbeat_stale_threshold_secs,
+            tls_cert,
+            tls_key,
+            tls_enabled,
         }
     }
 }

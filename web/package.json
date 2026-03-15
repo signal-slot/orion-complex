@@ -4,8 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "build:novnc": "cp node_modules/@novnc/novnc/lib/util/browser.js node_modules/@novnc/novnc/lib/util/browser.js.bak && sed 's/= await _checkWebCodecsH264DecodeSupport()/= _checkWebCodecsH264DecodeSupport()/' node_modules/@novnc/novnc/lib/util/browser.js.bak > node_modules/@novnc/novnc/lib/util/browser.js && npx rollup -c rollup.novnc.mjs && mv node_modules/@novnc/novnc/lib/util/browser.js.bak node_modules/@novnc/novnc/lib/util/browser.js",
+    "postinstall": "npm run build:novnc",
+    "dev": "node server.mjs",
+    "build": "npm run build:novnc && next build",
     "start": "next start",
     "lint": "next lint"
   },
@@ -14,18 +16,26 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@novnc/novnc": "^1.6.0",
     "@simplewebauthn/browser": "^11.0.0",
     "@types/qrcode": "^1.5.6",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "next": "^16.1.6",
     "qrcode": "^1.5.4",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },
   "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.2",
+    "@rollup/plugin-node-resolve": "^16.0.3",
     "@tailwindcss/postcss": "^4.2.1",
     "@types/node": "^25.5.0",
     "@types/react": "^19.2.14",
+    "@types/http-proxy": "^1.17.17",
+    "http-proxy": "^1.18.1",
     "postcss": "^8.5.8",
+    "rollup": "^4.59.0",
     "tailwindcss": "^4.2.1",
     "typescript": "^5.9.3"
   }

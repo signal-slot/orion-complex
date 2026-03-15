@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-orion-complex is a control-plane server for an ephemeral VM lab. It manages disposable VM environments across libvirt (Linux) and Apple Virtualization.framework (macOS) providers. The server is written in Rust (edition 2024) using axum + SQLite.
+orion-complex is a control-plane server for an ephemeral VM lab. It manages disposable VM environments across libvirt (Linux) and Apple Virtualization.framework + QEMU (macOS) providers. Three components work together: a Rust server, a Next.js web frontend, and a Swift macOS node agent.
 
 ## Build & Test
 
@@ -20,6 +20,18 @@ cargo fmt --check              # check formatting
 
 Tests use `StubProvider` (in-process fake VM backend) and in-memory SQLite with migrations applied via `sqlx::migrate!("./migrations")`.
 
+### Web Frontend
+
+```bash
+cd web
+npm install                    # install deps + auto-builds noVNC bundle (postinstall)
+npm run dev                    # starts custom HTTPS server on port 2742
+npm run build                  # production build (builds noVNC + next build)
+npm run build:novnc            # rebuild noVNC bundle only
+```
+
+Next.js 16+ with React 19, Tailwind CSS 4, TypeScript. Uses App Router with `(authenticated)` route group for protected pages.
+
 ### Swift macOS Agent
 
 ```bash
@@ -31,63 +43,94 @@ swift build --product orion-guest-agent  # build just the guest agent
 
 Requires macOS 13+ and Xcode with Virtualization.framework. The node agent uses `@main` via ArgumentParser — the entry point is in `NodeAgentCommand.swift` (not `main.swift`).
 
+## Running in Development
+
+Three processes are needed. Backend runs HTTP (no TLS) on localhost; frontend terminates HTTPS and proxies API requests.
+
+```bash
+# 1. Rust backend (port 2743, HTTP only in dev)
+TLS_ENABLED=false cargo run
+
+# 2. Next.js frontend (port 2742, HTTPS with self-signed cert)
+cd web && npm run dev
+
+# 3. macOS node agent (optional, needed for VZ/QEMU VM management)
+cd macos-agent && ORION_CONTROL_PLANE=http://127.0.0.1:2743 \
+  ORION_API_TOKEN=<jwt> ORION_NODE_ID=<uuid> .build/debug/orion-node-agent
+```
+
+Port 2742 is the frontend port. Port 2743 is the backend port. Never use port 3000.
+
 ## Environment Variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LISTEN_ADDR` | `127.0.0.1:3000` | Server bind address |
+| `LISTEN_ADDR` | `127.0.0.1:2743` | Server bind address |
 | `DATABASE_URL` | `sqlite:orion-complex.db?mode=rwc` | SQLite connection string |
 | `LIBVIRT_URI` | `qemu:///system` | libvirt hypervisor URI |
 | `DATA_DIR` | `/var/lib/orion-complex` | VM data directory |
 | `JWT_SECRET` | `dev-secret-change-in-production` | HMAC secret for session JWTs |
 | `CORS_ORIGINS` | permissive | Comma-separated allowed origins |
-| `GOOGLE_CLIENT_ID` / `MICROSOFT_CLIENT_ID` | none | OIDC provider client IDs |
-| `ALLOWED_DOMAINS` | none | Comma-separated email domains for auth |
+| `TLS_ENABLED` | `true` | Set to `false` to disable TLS (plain HTTP) |
+| `TLS_CERT` / `TLS_KEY` | auto-generated | Path to TLS PEM files |
+
+Node agent env vars: `ORION_CONTROL_PLANE`, `ORION_NODE_NAME`, `ORION_NODE_ID`, `ORION_API_TOKEN`, `ORION_BUNDLE_STORE`, `ORION_POLL_INTERVAL`.
 
 ## Architecture
 
+### Three-Component System
+
+```
+Browser → HTTPS (port 2742) → Next.js custom server (server.mjs)
+                                 ├── /v1/* → HTTP proxy → Rust backend (port 2743)
+                                 ├── /v1/*/ws/* → WebSocket proxy → Rust backend
+                                 └── everything else → Next.js App Router
+
+Rust backend ← polls ← macOS node agent (Swift)
+             → TCP proxy → VNC/SSH on VMs
+```
+
+The custom server (`web/server.mjs`) exists because Next.js rewrites cannot proxy WebSocket connections. It uses `http-proxy` to forward both HTTP and WebSocket `/v1/*` requests to the backend, while serving the frontend on the same HTTPS port.
+
 ### Rust Server (`src/`)
 
-- **`main.rs`** — Boots the server: config, DB pool, VM provider, background tasks (reaper + heartbeat checker), axum router with CORS/tracing.
-- **`lib.rs`** — Defines `AppState` (shared across handlers): `SqlitePool`, `AuthConfig`, `reqwest::Client`, `Arc<dyn VmProvider>`.
-- **`api/`** — Route handlers organized by resource. Each submodule exposes a `routes()` fn merged in `api/mod.rs`. All routes are under `/v1/`.
-- **`auth.rs`** — JWT session tokens + OIDC validation (Google/Microsoft). Provides `AuthUser` and `AdminUser` axum extractors.
-- **`models.rs`** — All DB models (`sqlx::FromRow`) and request types.
-- **`error.rs`** — `AppError` enum implementing axum's `IntoResponse` (returns JSON `{"error": "..."}` with appropriate status codes).
-- **`vm/mod.rs`** — `VmProvider` trait with methods: create, destroy, suspend, resume, reboot, snapshot, migrate. Two implementations:
-  - `vm/libvirt.rs` — Production backend (libvirt/QEMU)
-  - `vm/stub.rs` — Test stub (instant success, used in integration tests)
-- **`background.rs`** — Background tasks: TTL reaper (destroys expired envs), heartbeat checker (marks stale nodes offline), startup reconciliation (marks stuck transient-state envs as failed).
-- **`tasks.rs`** — Async task execution for VM lifecycle operations.
-- **`events.rs`** — Environment event audit log.
-
-### Scheduler
-
-Environment placement is in `api/environments.rs`. The scheduler matches `host_os` (libvirt→linux, macos→macos) and checks resource limits (CPU/memory/disk utilization ratios, max running envs) before placing an environment on a node.
+- **`main.rs`** — Boots server: config, DB pool, VM provider, background tasks, axum router.
+- **`lib.rs`** — `AppState` shared across handlers: `SqlitePool`, `AuthConfig`, `reqwest::Client`, `Arc<dyn VmProvider>`.
+- **`api/`** — Route handlers by resource, each exposes `routes()` merged in `api/mod.rs`. All under `/v1/`.
+- **`auth.rs`** — JWT session tokens + OIDC. `AuthUser` and `AdminUser` axum extractors.
+- **`api/webauthn.rs`** — TOTP (code-only login, server iterates all users) and WebAuthn passkey auth.
+- **`api/ws.rs`** — WebSocket proxy for VNC and SSH. Resolves target by looking up environment's `vnc_host`/`vnc_port` or `ssh_host`/`ssh_port`, then bridges WebSocket ↔ TCP.
+- **`tls.rs`** — Self-signed certificate generation via `rcgen` with localhost + LAN IP SANs.
+- **`vm/mod.rs`** — `VmProvider` trait. `vm/libvirt.rs` (production), `vm/stub.rs` (tests).
+- **`background.rs`** — TTL reaper, heartbeat checker, startup reconciliation.
 
 ### macOS Agent (`macos-agent/`)
 
-Swift package with two executables:
-- **`orion-node-agent`** (target: `NodeAgent`) — Runs on macOS hosts, manages VMs via Apple Virtualization.framework, reports to the control plane via polling.
-  - `NodeAgentCommand.swift` — Entry point, argument parsing, heartbeat loop
-  - `PollCycle.swift` — Main poll loop: handles environment state transitions (creating, suspending, resuming, rebooting, migrating, destroying) and SSH key provisioning
-  - `VMManager.swift` — Virtualization.framework wrapper: VM lifecycle, snapshots, migration export/import, guest provisioning via shared Virtio directory
-  - `APIClient.swift` — HTTP client for control plane REST API
-  - `IPSWRestore.swift` — macOS IPSW download and VM installation
-  - `Config.swift` — Environment-based configuration (`ORION_CONTROL_PLANE`, `ORION_NODE_NAME`, `ORION_API_TOKEN`, `ORION_BUNDLE_STORE`, `ORION_POLL_INTERVAL`)
-- **`orion-guest-agent`** (target: `GuestAgent`) — Runs inside macOS guest VMs. Watches a shared Virtio directory for provisioning commands (SSH key sync, user creation, shutdown).
+- **`NodeAgent`** — Polls control plane, executes VM lifecycle transitions.
+  - `VMManager.swift` — Virtualization.framework for arm64 macOS VMs; QEMU TCG for x86_64 Linux VMs.
+  - `PollCycle.swift` — State machine: creating → running, suspending, resuming, destroying. Reports VNC/SSH endpoints directly (VM internal IP, no port forwarding needed for web proxy).
+  - `PortForwarder.swift` — Optional port forwarding for external VNC/SSH client access.
+- **`GuestAgent`** — Runs inside macOS guest VMs, watches shared Virtio directory for provisioning.
 
-### Database
+### Web Frontend (`web/`)
 
-SQLite with migrations in `migrations/`. Migrations run automatically on startup via sqlx. Foreign keys are enabled per-connection via PRAGMA.
-
-### API Spec
-
-OpenAPI 3.1 spec at `spec/openapi.yaml`.
+- App Router with `(authenticated)` layout group wrapping protected routes.
+- `lib/auth.ts` — Token storage in localStorage, `AuthProvider` context.
+- `lib/api.ts` — API client, all requests go to same origin (proxied by server.mjs).
+- `components/Sidebar.tsx` — Responsive sidebar, mobile drawer.
+- noVNC loaded as pre-built IIFE bundle from `public/novnc-rfb.js`.
+- xterm.js for SSH terminal.
 
 ## Key Patterns
 
-- VM operations dispatched differently based on provider: `libvirt` provider runs in-process via `VmProvider` trait; `macos` provider is "agent-managed" — the control plane records state, and the macOS node agent polls and executes operations.
-- Owner-scoped authorization: regular users only see/manage their own environments; admins see all. Implemented via `check_env_owner()` in `api/mod.rs`.
-- Environment states follow a strict FSM: creating → running → suspending → suspended → resuming → running, with migration only from suspended state.
-- All list endpoints support `?offset=N&limit=N` pagination (default limit 50, max 200).
+- **Agent-managed providers**: `is_agent_managed()` returns true for `"macos"` and `"virtualization"` providers. These don't use the `VmProvider` trait — the control plane records desired state, and the node agent polls and executes.
+- **VNC/SSH proxy**: Backend connects directly to VM internal IPs (VZ: `192.168.64.x:5900`, QEMU: `127.0.0.1:VNC_PORT`). No port forwarding needed for web access.
+- **Environment FSM**: creating → running → suspending → suspended → resuming → running. Migration only from suspended state.
+- **Auth**: TOTP is the default login method. Code-only login — server iterates all users with `totp_secret` set to find match. WebAuthn passkeys also supported.
+- **noVNC bundling**: npm package ships broken CJS with top-level `await`. Build script patches it before rollup bundles into browser IIFE. See `web/rollup.novnc.mjs` and `build:novnc` script in `package.json`.
+- **All list endpoints**: `?offset=N&limit=N` pagination (default 50, max 200).
+- **All users see all environments** — this is a shared-resource system, not multi-tenant.
+
+## Database
+
+SQLite with migrations in `migrations/`. Migrations run automatically on startup. Foreign keys enabled per-connection via PRAGMA. API spec at `spec/openapi.yaml`.

@@ -147,24 +147,14 @@ enum NodeAgentHelpers {
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM running")
 
-                        // For QEMU VMs, always report the SSH endpoint (QEMU handles its own forwarding)
-                        if isQEMU, let sshPort = vmManager.qemuSSHPort(envId: env.id) {
-                            let hostIP = PortForwarder.hostLANIP() ?? "127.0.0.1"
-                            let _ = try? await api.updateEndpoints(
-                                envId: env.id,
-                                endpoints: .init(ssh_host: hostIP, ssh_port: sshPort, vnc_host: nil, vnc_port: nil)
-                            )
-                            logger.info("[\(env.id)] QEMU SSH endpoint: \(hostIP):\(sshPort)")
-                        } else if env.port_forwarding == 1 {
-                            // Set up port forwarding if enabled (VZ VMs)
-                            await setupPortForwarding(
-                                envId: env.id,
-                                vmManager: vmManager,
-                                portForwarder: portForwarder,
-                                api: api,
-                                logger: logger
-                            )
-                        }
+                        // Set up port forwarding and report LAN-accessible endpoints
+                        await setupPortForwarding(
+                            envId: env.id,
+                            vmManager: vmManager,
+                            portForwarder: portForwarder,
+                            api: api,
+                            logger: logger
+                        )
                     } catch {
                         logger.error("[\(env.id)] failed to create VM: \(error)")
                         let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
@@ -188,16 +178,14 @@ enum NodeAgentHelpers {
                         try await vmManager.resumeVM(envId: env.id)
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM resumed")
-                        // Re-establish port forwarding if enabled
-                        if env.port_forwarding == 1 {
-                            await setupPortForwarding(
-                                envId: env.id,
-                                vmManager: vmManager,
-                                portForwarder: portForwarder,
-                                api: api,
-                                logger: logger
-                            )
-                        }
+                        // Re-establish port forwarding
+                        await setupPortForwarding(
+                            envId: env.id,
+                            vmManager: vmManager,
+                            portForwarder: portForwarder,
+                            api: api,
+                            logger: logger
+                        )
                     } catch {
                         logger.error("[\(env.id)] failed to resume: \(error)")
                         let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
@@ -252,6 +240,46 @@ enum NodeAgentHelpers {
                     }
 
                 case "running":
+                    // Verify VM is actually alive — if agent restarted or VM crashed,
+                    // vmState returns nil (not tracked) or .stopped/.error
+                    let localState = vmManager.vmState(envId: env.id)
+                    if localState == nil {
+                        // VM not tracked by this agent — check if bundle exists
+                        let bundlePath = vmManager.bundlePath(envId: env.id)
+                        let bundleExists = FileManager.default.fileExists(atPath: bundlePath)
+                        if bundleExists {
+                            // Auto-recover: boot VM from existing bundle
+                            logger.info("[\(env.id)] VM not running but bundle exists — auto-recovering")
+                            let guestOS = env.guest_os ?? "macos"
+                            let guestArch = env.guest_arch ?? "arm64"
+                            do {
+                                try await vmManager.createVM(envId: env.id, guestOS: guestOS, guestArch: guestArch)
+                                logger.info("[\(env.id)] VM auto-recovered successfully")
+
+                                // Set up port forwarding and report LAN-accessible endpoints
+                                await setupPortForwarding(
+                                    envId: env.id,
+                                    vmManager: vmManager,
+                                    portForwarder: portForwarder,
+                                    api: api,
+                                    logger: logger
+                                )
+                            } catch {
+                                logger.error("[\(env.id)] auto-recovery failed: \(error) — marking as failed")
+                                let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
+                            }
+                            continue
+                        } else {
+                            logger.warning("[\(env.id)] VM bundle missing — marking as failed")
+                            let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
+                            continue
+                        }
+                    } else if localState == .stopped || localState == .error {
+                        logger.warning("[\(env.id)] VM is \(localState == .stopped ? "stopped" : "in error state") — marking as failed")
+                        let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
+                        continue
+                    }
+
                     // For running VMs, provision SSH keys via the shared directory
                     if let ownerId = env.owner_user_id {
                         do {
@@ -270,8 +298,18 @@ enum NodeAgentHelpers {
                         }
                     }
 
-                    // Handle port forwarding toggle
-                    if env.port_forwarding == 1 && !portForwarder.isForwarding(envId: env.id) {
+                    // Ensure endpoints are reported (may be missing after restart)
+                    // Endpoints always point to port-forwarded addresses (host LAN IP + forwarded port)
+                    // because VMs are on a private bridge100 network not accessible from LAN
+                    let needsEndpoints = env.vnc_host == nil || env.vnc_port == nil
+                    if needsEndpoints && portForwarder.isForwarding(envId: env.id) {
+                        // Endpoints already reported by setupPortForwarding
+                    } else if needsEndpoints {
+                        // Port forwarding not yet set up — will be handled below
+                    }
+
+                    // Always ensure port forwarding is active (VMs are on private bridge100 network)
+                    if !portForwarder.isForwarding(envId: env.id) {
                         await setupPortForwarding(
                             envId: env.id,
                             vmManager: vmManager,
@@ -279,13 +317,6 @@ enum NodeAgentHelpers {
                             api: api,
                             logger: logger
                         )
-                    } else if env.port_forwarding != 1 && portForwarder.isForwarding(envId: env.id) {
-                        portForwarder.stopForwarding(envId: env.id)
-                        let _ = try? await api.updateEndpoints(
-                            envId: env.id,
-                            endpoints: .init(ssh_host: nil, ssh_port: nil, vnc_host: nil, vnc_port: nil)
-                        )
-                        logger.info("[\(env.id)] port forwarding disabled")
                     }
 
                 default:
@@ -326,9 +357,9 @@ enum NodeAgentHelpers {
             return
         }
 
+        let (sshPort, vncPort) = portForwarder.startForwarding(envId: envId, vmIP: vmIP)
+        let hostIP = PortForwarder.hostLANIP() ?? "127.0.0.1"
         do {
-            let (sshPort, vncPort) = try portForwarder.startForwarding(envId: envId, vmIP: vmIP)
-            let hostIP = PortForwarder.hostLANIP() ?? "127.0.0.1"
             let _ = try await api.updateEndpoints(
                 envId: envId,
                 endpoints: .init(
@@ -340,8 +371,50 @@ enum NodeAgentHelpers {
             )
             logger.info("[\(envId)] port forwarding reported: SSH=\(hostIP):\(sshPort), VNC=\(hostIP):\(vncPort)")
         } catch {
-            logger.error("[\(envId)] failed to set up port forwarding: \(error)")
+            logger.error("[\(envId)] failed to report endpoints: \(error)")
         }
+    }
+
+    // MARK: - VZ VM endpoint discovery (no port forwarding)
+
+    private static func reportVZEndpoints(
+        envId: String,
+        vmManager: VMManager,
+        portForwarder: PortForwarder,
+        api: APIClient,
+        logger: Logger
+    ) async {
+        var vmIP: String?
+
+        // Try MAC-based discovery first
+        if let macAddress = vmManager.macAddress(envId: envId) {
+            vmIP = await portForwarder.discoverVMIP(macAddress: macAddress, retries: 10, interval: 2)
+        }
+
+        // Fallback: resolve by mDNS hostname
+        if vmIP == nil {
+            let shortId = String(envId.prefix(8))
+            let hostname = "orion-\(shortId)"
+            logger.info("[\(envId)] trying hostname resolution for \(hostname)")
+            vmIP = await portForwarder.discoverVMIPByHostname(hostname: hostname, retries: 10, interval: 2)
+        }
+
+        guard let vmIP = vmIP else {
+            logger.warning("[\(envId)] cannot report endpoints: VM IP not found")
+            return
+        }
+
+        // Report VM's internal IP directly — backend connects without port forwarding
+        let _ = try? await api.updateEndpoints(
+            envId: envId,
+            endpoints: .init(
+                ssh_host: vmIP,
+                ssh_port: 22,
+                vnc_host: vmIP,
+                vnc_port: 5900
+            )
+        )
+        logger.info("[\(envId)] VZ endpoints: SSH=\(vmIP):22, VNC=\(vmIP):5900")
     }
 
     // MARK: - System info helpers
