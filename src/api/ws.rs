@@ -116,19 +116,9 @@ async fn resolve_ssh_target(
         if let (Some(host), Some(port)) = (&env.ssh_host, env.ssh_port) {
             return Ok((host.clone(), port as u16, default_user.to_string()));
         }
-        // Fallback: node hostname with port 22
-        let node = sqlx::query_as::<_, crate::models::Node>(
-            "SELECT * FROM nodes WHERE id = ?",
-        )
-        .bind(env.node_id.as_deref().unwrap_or(""))
-        .fetch_optional(&state.db)
-        .await?;
-
-        let host = node
-            .and_then(|n| n.name)
-            .unwrap_or_else(|| "unknown".into());
-
-        return Ok((host, 22, default_user.to_string()));
+        return Err(AppError::BadRequest(
+            "SSH not available — waiting for node agent to report endpoint".into(),
+        ));
     }
 
     let provider_id = format!("libvirt-{}", env.id);
@@ -270,12 +260,45 @@ impl russh::client::Handler for SshHandler {
     }
 }
 
-async fn handle_ssh_proxy(ws: WebSocket, host: String, port: u16, ssh_user: String) {
-    tracing::info!("SSH proxy: connecting to {ssh_user}@{host}:{port}");
+/// SSH credentials sent by the browser as the first WebSocket text message.
+#[derive(Deserialize)]
+struct SshCredentials {
+    username: String,
+    password: String,
+    cols: Option<u32>,
+    rows: Option<u32>,
+}
 
-    // On macOS 15+, non-system binaries are blocked from local VM network access
-    // by Local Network Privacy. Use /usr/bin/nc as a bridge since system binaries
-    // are exempt from this restriction.
+async fn handle_ssh_proxy(ws: WebSocket, host: String, port: u16, _default_user: String) {
+    let (mut ws_sink, mut ws_stream) = ws.split();
+
+    // Wait for credentials from the browser (first text message)
+    let creds: SshCredentials = loop {
+        match ws_stream.next().await {
+            Some(Ok(Message::Text(text))) => {
+                match serde_json::from_str::<SshCredentials>(&text) {
+                    Ok(c) => break c,
+                    Err(e) => {
+                        let _ = ws_sink
+                            .send(Message::Text(
+                                format!("\r\nInvalid credentials format: {e}\r\n").into(),
+                            ))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => return,
+            _ => continue,
+        }
+    };
+
+    tracing::info!(
+        "SSH proxy: connecting as {}@{host}:{port}",
+        creds.username
+    );
+
+    // Spawn nc to bypass macOS Local Network Privacy
     let mut child = match tokio::process::Command::new("/usr/bin/nc")
         .arg(&host)
         .arg(port.to_string())
@@ -284,77 +307,60 @@ async fn handle_ssh_proxy(ws: WebSocket, host: String, port: u16, ssh_user: Stri
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(c) => {
-            tracing::info!("SSH proxy: nc bridge spawned to {host}:{port}");
-            c
-        }
+        Ok(c) => c,
         Err(e) => {
-            tracing::error!("SSH proxy: failed to spawn nc to {host}:{port}: {e}");
-            let (mut sink, _) = ws.split();
-            let _ = sink
-                .send(Message::Text(format!("\r\nSSH connection failed: {e}\r\n").into()))
+            let _ = ws_sink
+                .send(Message::Text(
+                    format!("\r\nSSH connection failed: {e}\r\n").into(),
+                ))
                 .await;
             return;
         }
     };
 
-    let nc_stdin = match child.stdin.take() {
-        Some(s) => s,
-        None => {
-            tracing::error!("SSH proxy: no stdin from nc");
-            return;
-        }
-    };
-    let nc_stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            tracing::error!("SSH proxy: no stdout from nc");
-            return;
-        }
-    };
-
-    // Combine nc stdin/stdout into a single bidirectional stream for russh
+    let nc_stdin = child.stdin.take().unwrap();
+    let nc_stdout = child.stdout.take().unwrap();
     let nc_stream = tokio::io::join(nc_stdout, nc_stdin);
 
     let config = Arc::new(russh::client::Config::default());
-    let handler = SshHandler;
-
-    let mut session = match russh::client::connect_stream(config, nc_stream, handler).await {
-        Ok(s) => {
-            tracing::info!("SSH proxy: russh session established via nc bridge");
-            s
-        }
+    let mut session = match russh::client::connect_stream(config, nc_stream, SshHandler).await {
+        Ok(s) => s,
         Err(e) => {
-            tracing::error!("SSH connect failed: {e}");
-            let (mut sink, _) = ws.split();
-            let _ = sink
-                .send(Message::Text(format!("\r\nSSH connection failed: {e}\r\n").into()))
+            let _ = ws_sink
+                .send(Message::Text(
+                    format!("\r\nSSH connection failed: {e}\r\n").into(),
+                ))
                 .await;
             return;
         }
     };
 
-    // Try password auth with common defaults
-    let mut authenticated = false;
-    for password in ["orion", "ubuntu", "admin", ""] {
-        match session.authenticate_password(ssh_user.clone(), password).await {
-            Ok(true) => {
-                authenticated = true;
-                break;
-            }
-            _ => continue,
+    // Authenticate with user-provided credentials
+    match session
+        .authenticate_password(&creds.username, &creds.password)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = ws_sink
+                .send(Message::Text(
+                    "\r\nAuthentication failed.\r\n".into(),
+                ))
+                .await;
+            return;
+        }
+        Err(e) => {
+            let _ = ws_sink
+                .send(Message::Text(
+                    format!("\r\nAuthentication error: {e}\r\n").into(),
+                ))
+                .await;
+            return;
         }
     }
 
-    if !authenticated {
-        let (mut sink, _) = ws.split();
-        let _ = sink
-            .send(Message::Text(
-                "\r\nSSH authentication failed.\r\n".into(),
-            ))
-            .await;
-        return;
-    }
+    let cols = creds.cols.unwrap_or(80);
+    let rows = creds.rows.unwrap_or(24);
 
     let channel = match session.channel_open_session().await {
         Ok(ch) => ch,
@@ -365,7 +371,7 @@ async fn handle_ssh_proxy(ws: WebSocket, host: String, port: u16, ssh_user: Stri
     };
 
     if let Err(e) = channel
-        .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
+        .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
         .await
     {
         tracing::error!("SSH PTY request failed: {e}");
@@ -379,7 +385,6 @@ async fn handle_ssh_proxy(ws: WebSocket, host: String, port: u16, ssh_user: Stri
 
     let mut stream = channel.into_stream();
     let (mut ssh_read, mut ssh_write) = tokio::io::split(&mut stream);
-    let (mut ws_sink, mut ws_stream) = ws.split();
 
     let ws_to_ssh = async {
         while let Some(Ok(msg)) = ws_stream.next().await {

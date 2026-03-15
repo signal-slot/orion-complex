@@ -60,7 +60,10 @@ export default function EnvironmentDetailPage() {
   }, [fetchEnvironment]);
 
   useEffect(() => {
-    if (!env || !TRANSIENT_STATES.has(env.state ?? "")) return;
+    // Poll during transient states OR when port forwarding is on but endpoints not yet set
+    const isTransientState = env && TRANSIENT_STATES.has(env.state ?? "");
+    const awaitingEndpoints = env?.port_forwarding === 1 && !env.ssh_host;
+    if (!isTransientState && !awaitingEndpoints) return;
     const interval = setInterval(fetchEnvironment, 3000);
     return () => clearInterval(interval);
   }, [env, fetchEnvironment]);
@@ -224,104 +227,97 @@ export default function EnvironmentDetailPage() {
             )}
           </div>
           <div className="space-y-3">
-            {/* Browser-based access */}
-            <div className="flex gap-3">
-              <a
-                href={`/environments/${env.id}/ssh`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex-1 rounded-lg bg-green-700 px-4 py-2.5 text-sm font-medium text-white text-center hover:bg-green-600 transition-colors"
-              >
-                Open SSH Terminal
-              </a>
-              {env.guest_os === "macos" && env.vnc_host ? (
-                <a
-                  href={`vnc://${env.vnc_host}:${env.vnc_port || 5900}`}
-                  className="flex-1 rounded-lg bg-blue-700 px-4 py-2.5 text-sm font-medium text-white text-center hover:bg-blue-600 transition-colors"
-                >
-                  Screen Sharing
-                </a>
-              ) : env.guest_os !== "macos" ? (
-                <a
-                  href={`/environments/${env.id}/vnc`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex-1 rounded-lg bg-blue-700 px-4 py-2.5 text-sm font-medium text-white text-center hover:bg-blue-600 transition-colors"
-                >
-                  Open VNC
-                </a>
-              ) : null}
-            </div>
-            {/* Local access (mDNS) */}
-            {sshEndpoint && !env.port_forwarding && (() => {
-              const vmHost = `orion-${env.id.slice(0, 8)}.local`;
+            {/* SSH access */}
+            {(() => {
+              const sshHost = env.port_forwarding === 1 && env.ssh_host
+                ? env.ssh_host
+                : `orion-${env.id.slice(0, 8)}.local`;
+              const sshPort = env.port_forwarding === 1 && env.ssh_port
+                ? env.ssh_port
+                : 22;
+              const sshCmd = sshPort === 22
+                ? `ssh admin@${sshHost}`
+                : `ssh admin@${sshHost} -p ${sshPort}`;
+              const label = env.port_forwarding === 1 && env.ssh_host ? "SSH (LAN)" : "SSH";
               return (
                 <div>
-                  <p className="text-xs text-zinc-500 mb-1.5">SSH (local)</p>
+                  <p className="text-xs text-zinc-500 mb-1.5">{label}</p>
                   <div className="flex items-center gap-3">
                     <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-green-400 font-mono">
-                      ssh root@{vmHost}
+                      {sshCmd}
                     </code>
                     <button
-                      onClick={() => navigator.clipboard.writeText(`ssh root@${vmHost}`)}
+                      onClick={() => navigator.clipboard.writeText(sshCmd)}
                       className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
                     >
                       Copy
                     </button>
+                    <a
+                      href={`/environments/${env.id}/ssh`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="rounded-lg bg-green-700 px-3 py-2.5 text-xs font-medium text-white hover:bg-green-600 transition-colors whitespace-nowrap"
+                    >
+                      Open
+                    </a>
                   </div>
                 </div>
               );
             })()}
-            {!env.port_forwarding && env.guest_os === "macos" && (
+            {/* VNC access */}
+            {env.guest_os === "macos" ? (
+              env.port_forwarding === 1 ? (
+                env.vnc_host && env.vnc_port ? (
+                  <div>
+                    <p className="text-xs text-zinc-500 mb-1.5">Screen Sharing (LAN)</p>
+                    <div className="flex items-center gap-3">
+                      <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-blue-400 font-mono">
+                        vnc://{env.vnc_host}:{env.vnc_port}
+                      </code>
+                      <button
+                        onClick={() => navigator.clipboard.writeText(`vnc://${env.vnc_host}:${env.vnc_port}`)}
+                        className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+                      >
+                        Copy
+                      </button>
+                      <a
+                        href={`vnc://${env.vnc_host}:${env.vnc_port}`}
+                        className="rounded-lg bg-blue-700 px-3 py-2.5 text-xs font-medium text-white hover:bg-blue-600 transition-colors whitespace-nowrap"
+                      >
+                        Open
+                      </a>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-zinc-500">Setting up port forwarding...</p>
+                )
+              ) : (
+                <div className="rounded-lg bg-zinc-800/50 border border-zinc-700/50 px-4 py-3">
+                  <p className="text-sm text-zinc-400">
+                    VNC is not available without port forwarding. macOS VMs are on a private network not accessible from the LAN.
+                  </p>
+                  <p className="text-xs text-zinc-500 mt-1">
+                    Enable Port Forwarding above to access Screen Sharing from other machines.
+                  </p>
+                </div>
+              )
+            ) : (
               <div>
-                <p className="text-xs text-zinc-500 mb-1.5">Screen Sharing (local)</p>
+                <p className="text-xs text-zinc-500 mb-1.5">VNC</p>
                 <div className="flex items-center gap-3">
-                  <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-blue-400 font-mono">
-                    vnc://orion-{env.id.slice(0, 8)}.local
-                  </code>
-                  <button
-                    onClick={() => navigator.clipboard.writeText(`vnc://orion-${env.id.slice(0, 8)}.local`)}
-                    className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+                  <a
+                    href={`/environments/${env.id}/vnc`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="rounded-lg bg-blue-700 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-600 transition-colors"
                   >
-                    Copy
-                  </button>
+                    Open VNC
+                  </a>
                 </div>
               </div>
             )}
-            {/* Port-forwarded access (LAN) */}
-            {env.port_forwarding === 1 && env.ssh_host && env.ssh_port && (
-              <div>
-                <p className="text-xs text-zinc-500 mb-1.5">SSH (LAN)</p>
-                <div className="flex items-center gap-3">
-                  <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-green-400 font-mono">
-                    ssh root@{env.ssh_host} -p {env.ssh_port}
-                  </code>
-                  <button
-                    onClick={() => navigator.clipboard.writeText(`ssh root@${env.ssh_host} -p ${env.ssh_port}`)}
-                    className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
-                  >
-                    Copy
-                  </button>
-                </div>
-              </div>
-            )}
-            {env.port_forwarding === 1 && env.vnc_host && env.vnc_port && (
-              <div>
-                <p className="text-xs text-zinc-500 mb-1.5">VNC (LAN)</p>
-                <div className="flex items-center gap-3">
-                  <code className="flex-1 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-blue-400 font-mono">
-                    vnc://{env.vnc_host}:{env.vnc_port}
-                  </code>
-                  <button
-                    onClick={() => navigator.clipboard.writeText(`vnc://${env.vnc_host}:${env.vnc_port}`)}
-                    className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
-                  >
-                    Copy
-                  </button>
-                </div>
-              </div>
-            )}
-            {env.port_forwarding === 1 && !env.ssh_host && (
+            {/* Port-forwarded SSH endpoint (only when forwarding is on and endpoints are pending) */}
+            {env.port_forwarding === 1 && !env.ssh_host && env.guest_os !== "macos" && (
               <p className="text-sm text-zinc-500">Setting up port forwarding...</p>
             )}
           </div>

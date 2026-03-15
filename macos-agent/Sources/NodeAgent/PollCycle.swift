@@ -147,14 +147,24 @@ enum NodeAgentHelpers {
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM running")
 
-                        // Set up port forwarding and report LAN-accessible endpoints
-                        await setupPortForwarding(
-                            envId: env.id,
-                            vmManager: vmManager,
-                            portForwarder: portForwarder,
-                            api: api,
-                            logger: logger
-                        )
+                        // Set up port forwarding if enabled, otherwise report internal IP
+                        if env.port_forwarding == 1 {
+                            await setupPortForwarding(
+                                envId: env.id,
+                                vmManager: vmManager,
+                                portForwarder: portForwarder,
+                                api: api,
+                                logger: logger
+                            )
+                        } else {
+                            await reportVMInternalEndpoints(
+                                envId: env.id,
+                                vmManager: vmManager,
+                                portForwarder: portForwarder,
+                                api: api,
+                                logger: logger
+                            )
+                        }
                     } catch {
                         logger.error("[\(env.id)] failed to create VM: \(error)")
                         let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
@@ -178,14 +188,24 @@ enum NodeAgentHelpers {
                         try await vmManager.resumeVM(envId: env.id)
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM resumed")
-                        // Re-establish port forwarding
-                        await setupPortForwarding(
-                            envId: env.id,
-                            vmManager: vmManager,
-                            portForwarder: portForwarder,
-                            api: api,
-                            logger: logger
-                        )
+                        // Re-establish port forwarding if enabled, otherwise report internal IP
+                        if env.port_forwarding == 1 {
+                            await setupPortForwarding(
+                                envId: env.id,
+                                vmManager: vmManager,
+                                portForwarder: portForwarder,
+                                api: api,
+                                logger: logger
+                            )
+                        } else {
+                            await reportVMInternalEndpoints(
+                                envId: env.id,
+                                vmManager: vmManager,
+                                portForwarder: portForwarder,
+                                api: api,
+                                logger: logger
+                            )
+                        }
                     } catch {
                         logger.error("[\(env.id)] failed to resume: \(error)")
                         let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
@@ -256,14 +276,24 @@ enum NodeAgentHelpers {
                                 try await vmManager.createVM(envId: env.id, guestOS: guestOS, guestArch: guestArch)
                                 logger.info("[\(env.id)] VM auto-recovered successfully")
 
-                                // Set up port forwarding and report LAN-accessible endpoints
-                                await setupPortForwarding(
-                                    envId: env.id,
-                                    vmManager: vmManager,
-                                    portForwarder: portForwarder,
-                                    api: api,
-                                    logger: logger
-                                )
+                                // Set up port forwarding if enabled, otherwise report internal IP
+                                if env.port_forwarding == 1 {
+                                    await setupPortForwarding(
+                                        envId: env.id,
+                                        vmManager: vmManager,
+                                        portForwarder: portForwarder,
+                                        api: api,
+                                        logger: logger
+                                    )
+                                } else {
+                                    await reportVMInternalEndpoints(
+                                        envId: env.id,
+                                        vmManager: vmManager,
+                                        portForwarder: portForwarder,
+                                        api: api,
+                                        logger: logger
+                                    )
+                                }
                             } catch {
                                 logger.error("[\(env.id)] auto-recovery failed: \(error) — marking as failed")
                                 let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
@@ -298,25 +328,34 @@ enum NodeAgentHelpers {
                         }
                     }
 
-                    // Ensure endpoints are reported (may be missing after restart)
-                    // Endpoints always point to port-forwarded addresses (host LAN IP + forwarded port)
-                    // because VMs are on a private bridge100 network not accessible from LAN
-                    let needsEndpoints = env.vnc_host == nil || env.vnc_port == nil
-                    if needsEndpoints && portForwarder.isForwarding(envId: env.id) {
-                        // Endpoints already reported by setupPortForwarding
-                    } else if needsEndpoints {
-                        // Port forwarding not yet set up — will be handled below
-                    }
-
-                    // Always ensure port forwarding is active (VMs are on private bridge100 network)
-                    if !portForwarder.isForwarding(envId: env.id) {
-                        await setupPortForwarding(
-                            envId: env.id,
-                            vmManager: vmManager,
-                            portForwarder: portForwarder,
-                            api: api,
-                            logger: logger
-                        )
+                    // Manage port forwarding based on the flag
+                    if env.port_forwarding == 1 {
+                        // Port forwarding enabled — ensure it's active
+                        if !portForwarder.isForwarding(envId: env.id) {
+                            await setupPortForwarding(
+                                envId: env.id,
+                                vmManager: vmManager,
+                                portForwarder: portForwarder,
+                                api: api,
+                                logger: logger
+                            )
+                        }
+                    } else {
+                        // Port forwarding disabled — stop if active
+                        if portForwarder.isForwarding(envId: env.id) {
+                            portForwarder.stopForwarding(envId: env.id)
+                            logger.info("[\(env.id)] port forwarding stopped (disabled by user)")
+                        }
+                        // Report VM internal IP so the backend WebSocket proxy can reach the VM
+                        if env.ssh_host == nil || env.vnc_host == nil {
+                            await reportVMInternalEndpoints(
+                                envId: env.id,
+                                vmManager: vmManager,
+                                portForwarder: portForwarder,
+                                api: api,
+                                logger: logger
+                            )
+                        }
                     }
 
                 default:
@@ -377,7 +416,7 @@ enum NodeAgentHelpers {
 
     // MARK: - VZ VM endpoint discovery (no port forwarding)
 
-    private static func reportVZEndpoints(
+    private static func reportVMInternalEndpoints(
         envId: String,
         vmManager: VMManager,
         portForwarder: PortForwarder,
