@@ -76,8 +76,8 @@ export default function DashboardPage() {
                 className="group rounded-xl border border-zinc-800 bg-zinc-900 p-5 hover:border-zinc-700 hover:bg-zinc-800/50 transition-colors"
               >
                 <div className="flex items-start justify-between">
-                  <span className="font-mono text-sm text-zinc-300 truncate max-w-[60%]">
-                    {env.id.slice(0, 8)}
+                  <span className="text-sm text-zinc-300 truncate max-w-[60%]" title={env.id}>
+                    {env.name ?? env.id.slice(0, 8)}
                   </span>
                   <StateBadge state={env.state} />
                 </div>

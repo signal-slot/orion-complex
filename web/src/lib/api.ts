@@ -403,6 +403,16 @@ export async function togglePortForwarding(
   });
 }
 
+export async function renameEnvironment(
+  envId: string,
+  name: string,
+): Promise<Environment> {
+  return request<Environment>(`/v1/environments/${envId}/name`, {
+    method: "PUT",
+    body: JSON.stringify({ name }),
+  });
+}
+
 export async function extendEnvironmentTtl(
   envId: string,
   body: ExtendTtlRequest,
@@ -532,6 +542,7 @@ export const api = {
   forceRebootEnvironment,
   restartEnvironment,
   migrateEnvironment,
+  renameEnvironment,
   togglePortForwarding,
   extendEnvironmentTtl,
   listSnapshots,

@@ -27,6 +27,7 @@ export default function NewEnvironmentPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [name, setName] = useState("");
   const [imageId, setImageId] = useState("");
   const [vcpus, setVcpus] = useState(4);
   const [memoryBytes, setMemoryBytes] = useState(MEMORY_OPTIONS[1].value);
@@ -63,6 +64,7 @@ export default function NewEnvironmentPage() {
       const ttlSeconds = ttlHours ? parseFloat(ttlHours) * 3600 : undefined;
       const env = await api.createEnvironment({
         image_id: imageId,
+        name: name.trim() || undefined,
         vcpus,
         memory_bytes: memoryBytes,
         disk_bytes: diskBytes,
@@ -95,6 +97,21 @@ export default function NewEnvironmentPage() {
       )}
 
       <form onSubmit={handleSubmit} className="space-y-5">
+        {/* Name */}
+        <div>
+          <label htmlFor="name" className="block text-sm font-medium text-zinc-300 mb-1.5">
+            Name (optional)
+          </label>
+          <input
+            id="name"
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Auto-generated if empty"
+            className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 placeholder-zinc-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          />
+        </div>
+
         {/* Image */}
         <div>
           <label htmlFor="image" className="block text-sm font-medium text-zinc-300 mb-1.5">

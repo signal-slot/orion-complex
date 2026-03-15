@@ -55,6 +55,7 @@ pub struct Image {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Environment {
     pub id: String,
+    pub name: Option<String>,
     pub image_id: Option<String>,
     pub owner_user_id: Option<String>,
     pub node_id: Option<String>,
@@ -132,11 +133,17 @@ pub struct WebauthnChallenge {
 #[derive(Debug, Deserialize)]
 pub struct CreateEnvironmentRequest {
     pub image_id: String,
+    pub name: Option<String>,
     pub node_id: Option<String>,
     pub ttl_seconds: Option<i64>,
     pub vcpus: Option<i64>,
     pub memory_bytes: Option<i64>,
     pub disk_bytes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameEnvironmentRequest {
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]

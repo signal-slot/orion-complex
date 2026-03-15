@@ -64,6 +64,7 @@ components:
       type: object
       properties:
         id: { type: string }
+        name: { type: string, nullable: true }
         image_id: { type: string }
         owner_user_id: { type: string }
         node_id: { type: string }
@@ -545,6 +546,7 @@ paths:
               required: [image_id]
               properties:
                 image_id: { type: string }
+                name: { type: string }
                 node_id: { type: string }
                 ttl_seconds: { type: integer }
                 vcpus: { type: integer, default: 2 }

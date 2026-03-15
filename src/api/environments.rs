@@ -9,7 +9,10 @@ use crate::AppState;
 use crate::auth::AuthUser;
 use crate::error::AppError;
 use crate::events;
-use crate::models::{CreateEnvironmentRequest, Environment, ExtendTtlRequest, MigrateRequest};
+use crate::models::{
+    CreateEnvironmentRequest, Environment, ExtendTtlRequest, MigrateRequest,
+    RenameEnvironmentRequest,
+};
 use crate::tasks;
 use crate::vm::VmCreateParams;
 
@@ -57,6 +60,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/v1/environments/{env_id}/endpoints",
             put(update_endpoints),
+        )
+        .route(
+            "/v1/environments/{env_id}/name",
+            put(rename_environment),
         )
 }
 
@@ -232,11 +239,21 @@ async fn create_environment(
 
     let expires_at = req.ttl_seconds.map(|ttl| now + ttl);
 
+    // Generate a default name from image name + short ID suffix if not provided
+    let name = req.name.unwrap_or_else(|| {
+        let img_name = image
+            .name
+            .as_deref()
+            .unwrap_or("env");
+        format!("{}-{}", img_name, &id[..8])
+    });
+
     sqlx::query(
-        "INSERT INTO environments (id, image_id, owner_user_id, node_id, provider, guest_os, guest_arch, state, created_at, expires_at, vcpus, memory_bytes, disk_bytes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?)",
+        "INSERT INTO environments (id, name, image_id, owner_user_id, node_id, provider, guest_os, guest_arch, state, created_at, expires_at, vcpus, memory_bytes, disk_bytes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?)",
     )
     .bind(&id)
+    .bind(&name)
     .bind(&req.image_id)
     .bind(&user.0.id)
     .bind(&node.id)
@@ -580,6 +597,28 @@ async fn update_endpoints(
     .bind(&env_id)
     .execute(&state.db)
     .await?;
+
+    let env = sqlx::query_as::<_, Environment>("SELECT * FROM environments WHERE id = ?")
+        .bind(&env_id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Json(env))
+}
+
+async fn rename_environment(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(env_id): Path<String>,
+    Json(req): Json<RenameEnvironmentRequest>,
+) -> Result<Json<Environment>, AppError> {
+    let env = fetch_env(&state, &env_id).await?;
+    check_env_owner(&user.0, &env)?;
+
+    sqlx::query("UPDATE environments SET name = ? WHERE id = ?")
+        .bind(&req.name)
+        .bind(&env_id)
+        .execute(&state.db)
+        .await?;
 
     let env = sqlx::query_as::<_, Environment>("SELECT * FROM environments WHERE id = ?")
         .bind(&env_id)

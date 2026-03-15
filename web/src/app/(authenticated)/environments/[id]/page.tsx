@@ -31,6 +31,8 @@ export default function EnvironmentDetailPage() {
   const [showDestroyModal, setShowDestroyModal] = useState(false);
   const [snapshotName, setSnapshotName] = useState("");
   const [creatingSnapshot, setCreatingSnapshot] = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [nameInput, setNameInput] = useState("");
 
   const fetchEnvironment = useCallback(async () => {
     try {
@@ -111,6 +113,17 @@ export default function EnvironmentDetailPage() {
     }
   }
 
+  async function handleRename() {
+    if (!nameInput.trim()) return;
+    try {
+      const updated = await api.renameEnvironment(envId, nameInput.trim());
+      setEnv(updated);
+      setEditingName(false);
+    } catch (err) {
+      console.error("Failed to rename:", err);
+    }
+  }
+
   async function handleCreateSnapshot() {
     setCreatingSnapshot(true);
     try {
@@ -156,7 +169,41 @@ export default function EnvironmentDetailPage() {
           >
             &larr;
           </button>
-          <h1 className="font-mono text-xl text-zinc-100">{env.id.slice(0, 12)}</h1>
+          {editingName ? (
+            <form
+              onSubmit={(e) => { e.preventDefault(); handleRename(); }}
+              className="flex items-center gap-2"
+            >
+              <input
+                type="text"
+                value={nameInput}
+                onChange={(e) => setNameInput(e.target.value)}
+                autoFocus
+                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xl text-zinc-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+              <button
+                type="submit"
+                className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-500 transition-colors"
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                onClick={() => setEditingName(false)}
+                className="rounded-lg border border-zinc-700 px-3 py-1.5 text-sm text-zinc-400 hover:bg-zinc-800 transition-colors"
+              >
+                Cancel
+              </button>
+            </form>
+          ) : (
+            <h1
+              className="text-xl text-zinc-100 cursor-pointer hover:text-indigo-400 transition-colors"
+              onClick={() => { setNameInput(env.name ?? env.id.slice(0, 8)); setEditingName(true); }}
+              title="Click to rename"
+            >
+              {env.name ?? env.id.slice(0, 8)}
+            </h1>
+          )}
           <StateBadge state={env.state} />
         </div>
       </div>

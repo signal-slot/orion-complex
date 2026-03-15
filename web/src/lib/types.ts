@@ -77,6 +77,7 @@ export interface Image {
 
 export interface Environment {
   id: string;
+  name: string | null;
   image_id: string | null;
   owner_user_id: string | null;
   node_id: string | null;
@@ -182,6 +183,7 @@ export interface LoginRequest {
 
 export interface CreateEnvironmentRequest {
   image_id: string;
+  name?: string;
   node_id?: string;
   ttl_seconds?: number;
   vcpus?: number;

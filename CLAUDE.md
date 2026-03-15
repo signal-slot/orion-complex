@@ -41,7 +41,12 @@ swift build --product orion-node-agent   # build just the node agent
 swift build --product orion-guest-agent  # build just the guest agent
 ```
 
-Requires macOS 13+ and Xcode with Virtualization.framework. The node agent uses `@main` via ArgumentParser — the entry point is in `NodeAgentCommand.swift` (not `main.swift`).
+Requires macOS 13+ and Xcode with Virtualization.framework. The node agent uses `@main` via ArgumentParser — the entry point is in `NodeAgentCommand.swift` (not `main.swift`). After building, the binary must be signed with the virtualization entitlement:
+
+```bash
+codesign --force --sign - --entitlements entitlements.plist .build/debug/orion-node-agent
+# entitlements.plist must contain com.apple.security.virtualization = true
+```
 
 ## Running in Development
 
@@ -99,7 +104,7 @@ The custom server (`web/server.mjs`) exists because Next.js rewrites cannot prox
 - **`api/`** — Route handlers by resource, each exposes `routes()` merged in `api/mod.rs`. All under `/v1/`.
 - **`auth.rs`** — JWT session tokens + OIDC. `AuthUser` and `AdminUser` axum extractors.
 - **`api/webauthn.rs`** — TOTP (code-only login, server iterates all users) and WebAuthn passkey auth.
-- **`api/ws.rs`** — WebSocket proxy for VNC and SSH. Resolves target by looking up environment's `vnc_host`/`vnc_port` or `ssh_host`/`ssh_port`, then bridges WebSocket ↔ TCP.
+- **`api/ws.rs`** — WebSocket proxy for VNC and SSH. VNC: raw TCP relay (WebSocket ↔ `/usr/bin/nc` ↔ VM VNC port). SSH: waits for user credentials from the browser as JSON `{username, password, cols, rows}`, then authenticates via `russh` and relays PTY I/O. Both use `/usr/bin/nc` to bypass macOS 15+ Local Network Privacy.
 - **`tls.rs`** — Self-signed certificate generation via `rcgen` with localhost + LAN IP SANs.
 - **`vm/mod.rs`** — `VmProvider` trait. `vm/libvirt.rs` (production), `vm/stub.rs` (tests).
 - **`background.rs`** — TTL reaper, heartbeat checker, startup reconciliation.
@@ -108,8 +113,8 @@ The custom server (`web/server.mjs`) exists because Next.js rewrites cannot prox
 
 - **`NodeAgent`** — Polls control plane, executes VM lifecycle transitions.
   - `VMManager.swift` — Virtualization.framework for arm64 macOS VMs; QEMU TCG for x86_64 Linux VMs.
-  - `PollCycle.swift` — State machine: creating → running, suspending, resuming, destroying. Reports VNC/SSH endpoints directly (VM internal IP, no port forwarding needed for web proxy).
-  - `PortForwarder.swift` — Optional port forwarding for external VNC/SSH client access.
+  - `PollCycle.swift` — State machine: creating → running, suspending, resuming, destroying. Reports VM internal IP endpoints when port forwarding is off (for web proxy), or host LAN IP + forwarded ports when on.
+  - `PortForwarder.swift` — TCP port forwarding (host LAN → VM private network) for external client access. Swift TCP listener on `0.0.0.0` + `/usr/bin/nc` per-connection bridge to bypass macOS Local Network Privacy. Controlled by `port_forwarding` flag on environment.
 - **`GuestAgent`** — Runs inside macOS guest VMs, watches shared Virtio directory for provisioning.
 
 ### Web Frontend (`web/`)
@@ -124,7 +129,8 @@ The custom server (`web/server.mjs`) exists because Next.js rewrites cannot prox
 ## Key Patterns
 
 - **Agent-managed providers**: `is_agent_managed()` returns true for `"macos"` and `"virtualization"` providers. These don't use the `VmProvider` trait — the control plane records desired state, and the node agent polls and executes.
-- **VNC/SSH proxy**: Backend connects directly to VM internal IPs (VZ: `192.168.64.x:5900`, QEMU: `127.0.0.1:VNC_PORT`). No port forwarding needed for web access.
+- **VNC/SSH proxy**: Backend uses `/usr/bin/nc` to connect to VMs (bypasses macOS Local Network Privacy). When port forwarding is off, connects to VM internal IP (`192.168.64.x`). When on, endpoints point to host LAN IP + forwarded ports. Browser noVNC works for non-macOS VMs only — macOS Screen Sharing uses proprietary Apple DH auth that noVNC doesn't support; use native `vnc://` client instead.
+- **SSH credentials**: Never auto-try passwords. The web SSH terminal prompts users for username and password, which are sent to the backend via the first WebSocket message.
 - **Environment FSM**: creating → running → suspending → suspended → resuming → running. Migration only from suspended state.
 - **Auth**: TOTP is the default login method. Code-only login — server iterates all users with `totp_secret` set to find match. WebAuthn passkeys also supported.
 - **noVNC bundling**: npm package ships broken CJS with top-level `await`. Build script patches it before rollup bundles into browser IIFE. See `web/rollup.novnc.mjs` and `build:novnc` script in `package.json`.
