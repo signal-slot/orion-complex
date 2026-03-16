@@ -320,10 +320,34 @@ final class VMManager {
 
     // MARK: - QEMU x86-64 VM creation
 
-    /// Next available host port for QEMU SSH forwarding.
-    private static var nextQEMUSSHPort = 12022
-    /// Next available host port for QEMU VNC.
-    private static var nextQEMUVNCPort = 15950
+    /// Find an available TCP port starting from `base`, skipping ports already in use.
+    private func findAvailablePort(base: Int) -> Int {
+        var port = base
+        while port < 65535 {
+            let sock = socket(AF_INET, SOCK_STREAM, 0)
+            guard sock >= 0 else { port += 1; continue }
+            defer { close(sock) }
+
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = in_port_t(port).bigEndian
+            addr.sin_addr.s_addr = INADDR_ANY
+
+            var optval: Int32 = 1
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &optval, socklen_t(MemoryLayout<Int32>.size))
+
+            let bindResult = withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                    bind(sock, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            if bindResult == 0 {
+                return port
+            }
+            port += 1
+        }
+        return base // fallback
+    }
 
     private func createQEMUVM(envId: String, cpuCount: Int, memoryGB: Int, winInstallOptions: WinInstallOptions? = nil) async throws {
         logger.info("creating QEMU x86-64 VM for environment \(envId)")
@@ -353,25 +377,47 @@ final class VMManager {
         pgrepCheck.waitUntilExit()
         let pgrepOutput = String(data: pgrepPipe.fileHandleForReading.availableData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if pgrepCheck.terminationStatus == 0 && !pgrepOutput.isEmpty {
-            // QEMU process exists — adopt it (nil process = adopted)
+            // QEMU process exists — adopt it. Parse ports from process args.
+            var adoptSSH = 12022
+            var adoptVNC = 15950
+            let psProc = Process()
+            psProc.executableURL = URL(fileURLWithPath: "/bin/ps")
+            psProc.arguments = ["-p", pgrepOutput.components(separatedBy: "\n").first ?? "", "-o", "args="]
+            let psPipe = Pipe()
+            psProc.standardOutput = psPipe
+            psProc.standardError = FileHandle.nullDevice
+            try? psProc.run()
+            psProc.waitUntilExit()
+            let psArgs = String(data: psPipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+            // Parse hostfwd=tcp::NNNNN-:22
+            if let range = psArgs.range(of: "hostfwd=tcp::(\\d+)-:22", options: .regularExpression) {
+                let match = psArgs[range]
+                if let portRange = match.range(of: "\\d+", options: .regularExpression) {
+                    adoptSSH = Int(match[portRange]) ?? adoptSSH
+                }
+            }
+            // Parse -vnc 127.0.0.1:NNNNN (offset from 5900)
+            if let range = psArgs.range(of: "-vnc 127\\.0\\.0\\.1:(\\d+)", options: .regularExpression) {
+                let match = psArgs[range]
+                if let portRange = match.range(of: "\\d+$", options: .regularExpression) {
+                    let vncOffset = Int(match[portRange]) ?? 10050
+                    adoptVNC = 5900 + vncOffset
+                }
+            }
             qemuVMs[envId] = RunningQEMUVM(
                 process: nil,
                 bundlePath: bundlePath,
                 monitorSocketPath: monitorSocket,
-                sshHostPort: VMManager.nextQEMUSSHPort,
-                vncHostPort: VMManager.nextQEMUVNCPort
+                sshHostPort: adoptSSH,
+                vncHostPort: adoptVNC
             )
-            VMManager.nextQEMUSSHPort += 1
-            VMManager.nextQEMUVNCPort += 1
-            logger.info("adopted existing QEMU process for \(envId) (pid \(pgrepOutput))")
+            logger.info("adopted existing QEMU process for \(envId) (pid \(pgrepOutput), SSH:\(adoptSSH), VNC:\(adoptVNC))")
             return
         }
 
-        // Allocate host ports for SSH and VNC forwarding
-        let sshPort = VMManager.nextQEMUSSHPort
-        VMManager.nextQEMUSSHPort += 1
-        let vncPort = VMManager.nextQEMUVNCPort
-        VMManager.nextQEMUVNCPort += 1
+        // Allocate available host ports for SSH and VNC forwarding
+        let sshPort = findAvailablePort(base: 12022)
+        let vncPort = findAvailablePort(base: 15950)
 
         // Build cloud-init ISO if seed files exist
         let ciISOPath = "\(bundlePath)/cidata.iso"
