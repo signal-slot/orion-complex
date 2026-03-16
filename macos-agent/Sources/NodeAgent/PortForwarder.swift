@@ -217,7 +217,30 @@ final class PortForwarder {
     // MARK: - Forwarding lifecycle
 
     /// Start port forwarding for an environment. Returns (sshPort, vncPort).
-    func startForwarding(envId: String, vmIP: String) -> (sshPort: Int, vncPort: Int) {
+    /// Check if a TCP port is reachable on a remote host (quick connect test).
+    func isTCPReachable(host: String, port: Int) -> Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { close(sock) }
+
+        // Set 2 second timeout
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(port).bigEndian
+        inet_pton(AF_INET, host, &addr.sin_addr)
+
+        let result = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(sock, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return result == 0
+    }
+
+    func startForwarding(envId: String, vmIP: String, includeVNC: Bool = true) -> (sshPort: Int, vncPort: Int) {
         // If already forwarding, stop first
         stopForwarding(envId: envId)
 
@@ -225,7 +248,9 @@ final class PortForwarder {
         let vncPort = allocatePort(starting: &nextVNCPort)
 
         let sshListener = startListener(listenPort: sshPort, targetHost: vmIP, targetPort: 22, label: "\(envId)/ssh")
-        let vncListener = startListener(listenPort: vncPort, targetHost: vmIP, targetPort: 5900, label: "\(envId)/vnc")
+        let vncListener = includeVNC
+            ? startListener(listenPort: vncPort, targetHost: vmIP, targetPort: 5900, label: "\(envId)/vnc")
+            : nil
 
         forwardings[envId] = Forwarding(
             vmIP: vmIP,
@@ -235,7 +260,11 @@ final class PortForwarder {
             vncListener: vncListener
         )
 
-        logger.info("[\(envId)] port forwarding started: SSH=0.0.0.0:\(sshPort)→\(vmIP):22, VNC=0.0.0.0:\(vncPort)→\(vmIP):5900")
+        if includeVNC {
+            logger.info("[\(envId)] port forwarding started: SSH=0.0.0.0:\(sshPort)→\(vmIP):22, VNC=0.0.0.0:\(vncPort)→\(vmIP):5900")
+        } else {
+            logger.info("[\(envId)] port forwarding started: SSH=0.0.0.0:\(sshPort)→\(vmIP):22 (VNC skipped)")
+        }
         return (sshPort, vncPort)
     }
 

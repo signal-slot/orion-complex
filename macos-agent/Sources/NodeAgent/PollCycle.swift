@@ -549,7 +549,10 @@ enum NodeAgentHelpers {
             return
         }
 
-        let (sshPort, vncPort) = portForwarder.startForwarding(envId: envId, vmIP: vmIP)
+        // Check if VNC is actually reachable on the VM before forwarding it
+        let vncReachable = portForwarder.isTCPReachable(host: vmIP, port: 5900)
+
+        let (sshPort, vncPort) = portForwarder.startForwarding(envId: envId, vmIP: vmIP, includeVNC: vncReachable)
         let hostIP = PortForwarder.hostLANIP() ?? "127.0.0.1"
         do {
             let _ = try await api.updateEndpoints(
@@ -557,11 +560,15 @@ enum NodeAgentHelpers {
                 endpoints: .init(
                     ssh_host: hostIP,
                     ssh_port: sshPort,
-                    vnc_host: hostIP,
-                    vnc_port: vncPort
+                    vnc_host: vncReachable ? hostIP : nil,
+                    vnc_port: vncReachable ? vncPort : nil
                 )
             )
-            logger.info("[\(envId)] port forwarding reported: SSH=\(hostIP):\(sshPort), VNC=\(hostIP):\(vncPort)")
+            if vncReachable {
+                logger.info("[\(envId)] port forwarding reported: SSH=\(hostIP):\(sshPort), VNC=\(hostIP):\(vncPort)")
+            } else {
+                logger.info("[\(envId)] port forwarding reported: SSH=\(hostIP):\(sshPort) (VNC not reachable on guest)")
+            }
         } catch {
             logger.error("[\(envId)] failed to report endpoints: \(error)")
         }
