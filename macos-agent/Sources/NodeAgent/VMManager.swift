@@ -848,37 +848,36 @@ final class VMManager {
 
         logger.info("destroying VM for environment \(envId)")
 
-        if running.vm.canRequestStop {
-            try running.vm.requestStop()
-            // Wait up to 10s for graceful shutdown
-            for _ in 0..<20 {
-                try await Task.sleep(nanoseconds: 500_000_000)
-                if running.vm.state == .stopped { break }
-            }
-        }
-
-        if running.vm.state != .stopped {
-            // Force stop with timeout
-            do {
-                try await withThrowingTaskGroup(of: Void.self) { group in
-                    group.addTask {
+        // Entire VM stop with a hard 15s timeout
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    // Try graceful stop first
+                    if running.vm.canRequestStop {
+                        try? running.vm.requestStop()
+                        for _ in 0..<10 {
+                            try await Task.sleep(nanoseconds: 500_000_000)
+                            if running.vm.state == .stopped { return }
+                        }
+                    }
+                    // Force stop
+                    if running.vm.state != .stopped {
                         try await self.stopVMOnMain(running.vm)
                     }
-                    group.addTask {
-                        try await Task.sleep(nanoseconds: 10_000_000_000)
-                        throw VMError.notFound("force stop timeout")
-                    }
-                    // Wait for whichever finishes first
-                    try await group.next()
-                    group.cancelAll()
                 }
-            } catch {
-                logger.warning("force stop timed out for \(envId), proceeding with cleanup")
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 15_000_000_000)
+                    throw VMError.notFound("VM stop timeout")
+                }
+                try await group.next()
+                group.cancelAll()
             }
+        } catch {
+            logger.warning("VM stop timed out for \(envId), proceeding with cleanup anyway")
         }
 
-        // Remove the bundle directory
-        try FileManager.default.removeItem(atPath: running.bundlePath)
+        // Remove the bundle directory regardless of stop result
+        try? FileManager.default.removeItem(atPath: running.bundlePath)
         logger.info("VM destroyed for environment \(envId)")
     }
 
