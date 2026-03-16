@@ -389,7 +389,9 @@ export default function EnvironmentDetailPage() {
             ) : isAgentManaged ? (
               <div className="rounded-lg bg-zinc-800/50 border border-zinc-700/50 px-4 py-3">
                 <p className="text-sm text-zinc-400">
-                  VNC is not available yet. Enable Port Forwarding above, or wait for the VM to become reachable.
+                  {env.guest_os === "linux" && env.guest_arch === "arm64"
+                    ? "VNC requires a VNC server running inside the guest (e.g. tigervnc-standalone-server). SSH is available above."
+                    : "VNC is not available yet. Enable Port Forwarding above, or wait for the VM to become reachable."}
                 </p>
               </div>
             ) : null}

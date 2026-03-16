@@ -81,7 +81,7 @@ export default function VncPage() {
           if (cancelled) return;
           setStatus("disconnected");
           if (!e.detail.clean) {
-            setErrorMsg("VNC connection failed — the VM may still be booting. Wait a moment and reload.");
+            setErrorMsg("VNC connection failed — the VM may still be booting, or no VNC server is running in the guest. For Linux VMs, install a VNC server (e.g. tigervnc-standalone-server) inside the VM first.");
           }
         });
 
