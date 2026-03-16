@@ -367,7 +367,7 @@ export default function EnvironmentDetailPage() {
                   </p>
                 </div>
               )
-            ) : (
+            ) : env.vnc_host ? (
               <div>
                 <p className="text-xs text-zinc-500 mb-1.5">VNC</p>
                 <div className="flex items-center gap-3">
@@ -381,7 +381,13 @@ export default function EnvironmentDetailPage() {
                   </a>
                 </div>
               </div>
-            )}
+            ) : isAgentManaged ? (
+              <div className="rounded-lg bg-zinc-800/50 border border-zinc-700/50 px-4 py-3">
+                <p className="text-sm text-zinc-400">
+                  VNC is not available yet. Enable Port Forwarding above, or wait for the VM to become reachable.
+                </p>
+              </div>
+            ) : null}
             {/* Port-forwarded SSH endpoint (only when forwarding is on and endpoints are pending) */}
             {env.port_forwarding === 1 && !env.ssh_host && env.guest_os !== "macos" && (
               <p className="text-sm text-zinc-500">Setting up port forwarding...</p>
