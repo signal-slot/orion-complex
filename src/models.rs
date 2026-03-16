@@ -132,6 +132,16 @@ pub struct WebauthnChallenge {
     pub expires_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UsbAttachment {
+    pub id: String,
+    pub env_id: String,
+    pub vendor_id: String,
+    pub product_id: String,
+    pub description: Option<String>,
+    pub attached_at: i64,
+}
+
 // --- Request types ---
 
 #[derive(Debug, Deserialize)]
@@ -215,4 +225,10 @@ pub struct UpdateUserRoleRequest {
 #[derive(Debug, Deserialize)]
 pub struct SetUserDisabledRequest {
     pub disabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AttachUsbRequest {
+    pub vendor_id: String,
+    pub product_id: String,
 }

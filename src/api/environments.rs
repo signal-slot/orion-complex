@@ -11,7 +11,7 @@ use crate::error::AppError;
 use crate::events;
 use crate::models::{
     CaptureImageRequest, CreateEnvironmentRequest, Environment, ExtendTtlRequest, MigrateRequest,
-    RenameEnvironmentRequest,
+    RenameEnvironmentRequest, UsbAttachment,
 };
 use crate::tasks;
 use crate::vm::VmCreateParams;
@@ -453,10 +453,7 @@ async fn destroy_environment(
 
     // If already destroying, the agent is confirming deletion — remove from DB
     if current == "destroying" {
-        sqlx::query("DELETE FROM environments WHERE id = ?")
-            .bind(&env_id)
-            .execute(&state.db)
-            .await?;
+        crate::delete_environment_cascade(&state.db, &env_id).await;
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -485,17 +482,35 @@ async fn destroy_environment(
 
         let vm_provider = state.vm_provider.clone();
         let db = state.db.clone();
+        let libvirt_uri = state.libvirt_uri.clone();
         let env_id_clone = env_id.clone();
         tokio::spawn(async move {
             let _ = tasks::update_task_state(&db, &task_id, "running").await;
+
+            // Detach any USB devices before destroying the VM
+            if let Some(ref uri) = libvirt_uri {
+                let usb_devices: Vec<UsbAttachment> = sqlx::query_as(
+                    "SELECT * FROM usb_attachments WHERE env_id = ?",
+                )
+                .bind(&env_id_clone)
+                .fetch_all(&db)
+                .await
+                .unwrap_or_default();
+
+                if !usb_devices.is_empty() {
+                    let domain = crate::vm::libvirt::env_domain_name(&env_id_clone);
+                    let devs: Vec<(String, String)> = usb_devices
+                        .iter()
+                        .map(|a| (a.vendor_id.clone(), a.product_id.clone()))
+                        .collect();
+                    crate::vm::libvirt::detach_all_usb(uri, &domain, &devs).await;
+                }
+            }
+
             let provider_id = format!("libvirt-{env_id_clone}");
             match vm_provider.destroy_vm(&provider_id).await {
                 Ok(()) => {
-                    let _ = sqlx::query("DELETE FROM environments WHERE id = ?")
-                        .bind(&env_id_clone)
-                        .execute(&db)
-                        .await;
-                    let _ = tasks::update_task_state(&db, &task_id, "completed").await;
+                    crate::delete_environment_cascade(&db, &env_id_clone).await;
                     tracing::info!(env_id = %env_id_clone, "environment destroyed");
                 }
                 Err(e) => {

@@ -82,6 +82,7 @@ mod helpers {
             vm_provider,
             webauthn,
             data_dir: "/tmp/orion-test".into(),
+            libvirt_uri: None,
         };
 
         let app = orion_complex::api::router()

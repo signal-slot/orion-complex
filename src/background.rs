@@ -73,10 +73,7 @@ async fn reap_expired(
             tokio::spawn(async move {
                 match vm.destroy_vm(&provider_id).await {
                     Ok(()) => {
-                        let _ = sqlx::query("DELETE FROM environments WHERE id = ?")
-                            .bind(&env_id)
-                            .execute(&db)
-                            .await;
+                        crate::delete_environment_cascade(&db, &env_id).await;
                         tracing::info!(env_id = %env_id, "expired environment destroyed");
                     }
                     Err(e) => {
@@ -157,9 +154,10 @@ async fn check_heartbeats(db: &SqlitePool, stale_threshold_secs: i64) -> Result<
     Ok(())
 }
 
-/// On startup, mark environments stuck in transient states as failed.
-/// These are environments that were mid-operation when the server crashed.
-pub async fn reconcile_stuck_environments(db: &SqlitePool) {
+/// On startup, reconcile environments stuck in transient states from a previous crash.
+/// - `destroying`: finish the destroy (best-effort VM cleanup + delete DB row)
+/// - Other transient states: mark as failed
+pub async fn reconcile_stuck_environments(db: &SqlitePool, vm_provider: &Arc<dyn VmProvider>) {
     let stuck: Vec<crate::models::Environment> = sqlx::query_as(
         "SELECT * FROM environments WHERE state IN ('creating', 'suspending', 'resuming', 'rebooting', 'migrating', 'destroying')",
     )
@@ -167,39 +165,59 @@ pub async fn reconcile_stuck_environments(db: &SqlitePool) {
     .await
     .unwrap_or_default();
 
+    let mut count = 0u64;
     for env in &stuck {
         let provider = env.provider.as_deref().unwrap_or("libvirt");
-        // Agent-managed environments are handled by the node agent, not the server.
-        // Don't mark them as failed — the agent will recover them.
         if is_agent_managed(provider) {
             continue;
         }
+
         let state = env.state.as_deref().unwrap_or("");
-        tracing::warn!(
-            env_id = %env.id,
-            state = %state,
-            "marking stuck environment as failed (server restart recovery)"
-        );
-        let _ = sqlx::query("UPDATE environments SET state = 'failed' WHERE id = ?")
-            .bind(&env.id)
-            .execute(db)
+
+        if state == "destroying" {
+            // The destroy was interrupted — finish it.
+            // Best-effort VM cleanup (may already be gone).
+            let provider_id = format!("libvirt-{}", env.id);
+            if let Err(e) = vm_provider.destroy_vm(&provider_id).await {
+                tracing::debug!(env_id = %env.id, error = %e, "VM already gone or destroy failed during reconciliation");
+            }
+            crate::delete_environment_cascade(db, &env.id).await;
+            events::emit(
+                db,
+                &env.id,
+                "state_change",
+                Some("destroying"),
+                None,
+                Some("system"),
+                Some("completed interrupted destroy on server restart"),
+            )
             .await;
-        events::emit(
-            db,
-            &env.id,
-            "state_change",
-            Some(state),
-            Some("failed"),
-            Some("system"),
-            Some("stuck in transient state after server restart"),
-        )
-        .await;
+            tracing::info!(env_id = %env.id, "completed interrupted destroy on startup");
+        } else {
+            tracing::warn!(
+                env_id = %env.id,
+                state = %state,
+                "marking stuck environment as failed (server restart recovery)"
+            );
+            let _ = sqlx::query("UPDATE environments SET state = 'failed' WHERE id = ?")
+                .bind(&env.id)
+                .execute(db)
+                .await;
+            events::emit(
+                db,
+                &env.id,
+                "state_change",
+                Some(state),
+                Some("failed"),
+                Some("system"),
+                Some("stuck in transient state after server restart"),
+            )
+            .await;
+        }
+        count += 1;
     }
 
-    if !stuck.is_empty() {
-        tracing::info!(
-            count = stuck.len(),
-            "reconciled stuck environments on startup"
-        );
+    if count > 0 {
+        tracing::info!(count, "reconciled stuck environments on startup");
     }
 }

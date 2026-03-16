@@ -8,6 +8,7 @@ pub mod nodes;
 pub mod snapshots;
 pub mod ssh_keys;
 pub mod tasks;
+pub mod usb;
 pub mod users;
 pub mod webauthn;
 pub mod uploads;
@@ -33,6 +34,7 @@ pub fn router() -> Router<AppState> {
         .merge(snapshots::routes())
         .merge(tasks::routes())
         .merge(events::routes())
+        .merge(usb::routes())
         .merge(webauthn::routes())
         .merge(uploads::routes())
         .merge(ws::routes())

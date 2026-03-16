@@ -26,14 +26,17 @@ impl Config {
             .parse()
             .expect("invalid LISTEN_ADDR");
 
-        let database_url =
-            env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:orion-complex.db?mode=rwc".into());
+        let data_dir =
+            env::var("DATA_DIR").unwrap_or_else(|_| "/var/lib/orion-complex".into());
+
+        let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
+            // Use DATA_DIR so the DB location is stable regardless of cwd.
+            let db_path = std::path::Path::new(&data_dir).join("orion-complex.db");
+            format!("sqlite:{}?mode=rwc", db_path.display())
+        });
 
         let libvirt_uri =
             env::var("LIBVIRT_URI").unwrap_or_else(|_| "qemu:///system".into());
-
-        let data_dir =
-            env::var("DATA_DIR").unwrap_or_else(|_| "/var/lib/orion-complex".into());
 
         let cors_origins = env::var("CORS_ORIGINS").ok().map(|s| {
             s.split(',')

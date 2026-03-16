@@ -649,6 +649,120 @@ impl VmProvider for LibvirtProvider {
     }
 }
 
+// ── USB passthrough helpers ─────────────────────────────────────────
+
+/// Parse lsusb output into (bus, device, vendor_id, product_id, description).
+pub fn parse_lsusb(output: &str) -> Vec<(String, String, String, String, String)> {
+    let mut devices = Vec::new();
+    for line in output.lines() {
+        // Format: "Bus 001 Device 003: ID 1d6b:0002 Linux Foundation 2.0 root hub"
+        let Some((prefix, rest)) = line.split_once(": ID ") else {
+            continue;
+        };
+        let parts: Vec<&str> = prefix.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let bus = parts[1].to_string();
+        let device = parts[3].to_string();
+
+        let (id_part, description) = rest
+            .split_once(' ')
+            .unwrap_or((rest, "Unknown device"));
+        let Some((vendor_id, product_id)) = id_part.split_once(':') else {
+            continue;
+        };
+        devices.push((
+            bus,
+            device,
+            vendor_id.to_string(),
+            product_id.to_string(),
+            description.to_string(),
+        ));
+    }
+    devices
+}
+
+/// List USB devices on the host.
+pub async fn list_host_usb_devices() -> Result<Vec<(String, String, String, String, String)>, String> {
+    let output = Command::new("lsusb")
+        .output()
+        .await
+        .map_err(|e| format!("failed to run lsusb: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "lsusb failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(parse_lsusb(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn usb_hostdev_xml(vendor_id: &str, product_id: &str) -> String {
+    format!(
+        r#"<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x{vendor_id}'/>
+    <product id='0x{product_id}'/>
+  </source>
+</hostdev>"#
+    )
+}
+
+/// Attach a USB device to a running domain.
+pub async fn attach_usb(
+    uri: &str,
+    domain: &str,
+    vendor_id: &str,
+    product_id: &str,
+) -> Result<(), String> {
+    let xml = usb_hostdev_xml(vendor_id, product_id);
+    let tmp_path = format!(
+        "/tmp/orion-usb-{}.xml",
+        uuid::Uuid::new_v4()
+    );
+    tokio::fs::write(&tmp_path, &xml)
+        .await
+        .map_err(|e| format!("write xml: {e}"))?;
+    let result = virsh(uri, &["attach-device", domain, &tmp_path, "--live"]).await;
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+    result.map(|_| ())
+}
+
+/// Detach a USB device from a running domain.
+pub async fn detach_usb(
+    uri: &str,
+    domain: &str,
+    vendor_id: &str,
+    product_id: &str,
+) -> Result<(), String> {
+    let xml = usb_hostdev_xml(vendor_id, product_id);
+    let tmp_path = format!(
+        "/tmp/orion-usb-{}.xml",
+        uuid::Uuid::new_v4()
+    );
+    tokio::fs::write(&tmp_path, &xml)
+        .await
+        .map_err(|e| format!("write xml: {e}"))?;
+    let result = virsh(uri, &["detach-device", domain, &tmp_path, "--live"]).await;
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+    result.map(|_| ())
+}
+
+/// Detach all USB devices for a domain. Best-effort; logs errors but continues.
+pub async fn detach_all_usb(uri: &str, domain: &str, devices: &[(String, String)]) {
+    for (vid, pid) in devices {
+        if let Err(e) = detach_usb(uri, domain, vid, pid).await {
+            tracing::warn!(domain, vendor_id = %vid, product_id = %pid, error = %e, "failed to detach USB during cleanup");
+        }
+    }
+}
+
+/// Map an environment ID to its libvirt domain name.
+pub fn env_domain_name(env_id: &str) -> String {
+    format!("orion-{env_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +819,25 @@ mod tests {
         assert!(xml.contains("<memory unit='KiB'>8388608</memory>"));
         assert!(xml.contains("/data/test/disk.qcow2"));
         assert!(xml.contains("arch='x86_64'"));
+    }
+
+    #[test]
+    fn test_parse_lsusb() {
+        let output = "Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub\n\
+                       Bus 002 Device 003: ID 046d:c077 Logitech, Inc. Mouse\n";
+        let devices = parse_lsusb(output);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0], ("001".into(), "001".into(), "1d6b".into(), "0002".into(), "Linux Foundation 2.0 root hub".into()));
+        assert_eq!(devices[1], ("002".into(), "003".into(), "046d".into(), "c077".into(), "Logitech, Inc. Mouse".into()));
+    }
+
+    #[test]
+    fn test_parse_lsusb_empty() {
+        assert!(parse_lsusb("").is_empty());
+    }
+
+    #[test]
+    fn test_env_domain_name() {
+        assert_eq!(env_domain_name("abc-123"), "orion-abc-123");
     }
 }

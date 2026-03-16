@@ -27,6 +27,7 @@ pub struct AppState {
     pub vm_provider: Arc<dyn VmProvider>,
     pub webauthn: Arc<Webauthn>,
     pub data_dir: String,
+    pub libvirt_uri: Option<String>,
 }
 
 pub fn unix_now() -> i64 {
@@ -34,4 +35,28 @@ pub fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+/// Delete an environment and all rows that reference it (tasks, snapshots, events, USB).
+pub async fn delete_environment_cascade(db: &SqlitePool, env_id: &str) {
+    let _ = sqlx::query("DELETE FROM usb_attachments WHERE env_id = ?")
+        .bind(env_id)
+        .execute(db)
+        .await;
+    let _ = sqlx::query("DELETE FROM tasks WHERE env_id = ?")
+        .bind(env_id)
+        .execute(db)
+        .await;
+    let _ = sqlx::query("DELETE FROM snapshots WHERE env_id = ?")
+        .bind(env_id)
+        .execute(db)
+        .await;
+    let _ = sqlx::query("DELETE FROM environment_events WHERE env_id = ?")
+        .bind(env_id)
+        .execute(db)
+        .await;
+    let _ = sqlx::query("DELETE FROM environments WHERE id = ?")
+        .bind(env_id)
+        .execute(db)
+        .await;
 }

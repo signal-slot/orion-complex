@@ -46,10 +46,11 @@ async fn main() {
         vm_provider,
         webauthn,
         data_dir: config.data_dir.clone(),
+        libvirt_uri: Some(config.libvirt_uri.clone()),
     };
 
     // Reconcile environments stuck in transient states from a previous crash
-    orion_complex::background::reconcile_stuck_environments(&state.db).await;
+    orion_complex::background::reconcile_stuck_environments(&state.db, &state.vm_provider).await;
 
     // Shutdown signal coordination
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
