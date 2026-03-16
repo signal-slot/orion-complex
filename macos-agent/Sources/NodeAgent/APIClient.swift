@@ -58,6 +58,8 @@ actor APIClient {
         let vnc_port: Int?
         let iso_url: String?
         let capture_image_id: String?
+        let bypass_hw_check: Int?
+        let win_install_options: String?
     }
 
     func listEnvironments() async throws -> [Environment] {

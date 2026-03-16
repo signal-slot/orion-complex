@@ -20,7 +20,7 @@ final class VMManager {
     }
 
     struct RunningQEMUVM {
-        let process: Process
+        let process: Process?  // nil when adopted from existing process
         let bundlePath: String
         let monitorSocketPath: String
         let sshHostPort: Int
@@ -63,13 +63,28 @@ final class VMManager {
 
     // MARK: - VM lifecycle
 
-    func createVM(envId: String, cpuCount: Int = 4, memoryGB: Int = 8, guestOS: String = "macos", guestArch: String? = nil) async throws {
+    struct WinInstallOptions: Codable {
+        var bypass_tpm: Bool?
+        var bypass_secure_boot: Bool?
+        var bypass_ram: Bool?
+        var bypass_cpu: Bool?
+        var language: String?
+        var timezone: String?
+        var username: String?
+        var password: String?
+        var auto_login: Bool?
+        var auto_partition: Bool?
+        var product_key: String?
+        var skip_oobe: Bool?
+    }
+
+    func createVM(envId: String, cpuCount: Int = 4, memoryGB: Int = 8, guestOS: String = "macos", guestArch: String? = nil, winInstallOptions: WinInstallOptions? = nil) async throws {
         // If guest arch is x86_64 on arm64 host, use QEMU emulation
         if guestArch == "x86_64" {
             // QEMU TCG emulation is slow; use smaller defaults
             let qemuCPUs = min(cpuCount, 2)
             let qemuMemGB = min(memoryGB, 2)
-            try await createQEMUVM(envId: envId, cpuCount: qemuCPUs, memoryGB: qemuMemGB)
+            try await createQEMUVM(envId: envId, cpuCount: qemuCPUs, memoryGB: qemuMemGB, winInstallOptions: winInstallOptions)
             return
         }
         switch guestOS {
@@ -310,7 +325,7 @@ final class VMManager {
     /// Next available host port for QEMU VNC.
     private static var nextQEMUVNCPort = 15950
 
-    private func createQEMUVM(envId: String, cpuCount: Int, memoryGB: Int) async throws {
+    private func createQEMUVM(envId: String, cpuCount: Int, memoryGB: Int, winInstallOptions: WinInstallOptions? = nil) async throws {
         logger.info("creating QEMU x86-64 VM for environment \(envId)")
 
         let bundlePath = "\(bundleStorePath)/\(envId).bundle"
@@ -324,6 +339,32 @@ final class VMManager {
         // Disk image must already exist (cloned from template)
         guard FileManager.default.fileExists(atPath: diskPath) else {
             throw VMError.diskCreationFailed(diskPath)
+        }
+
+        // Check if QEMU is already running for this env (agent restart recovery)
+        // Use pgrep to find an existing process referencing this bundle
+        let pgrepCheck = Process()
+        pgrepCheck.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrepCheck.arguments = ["-f", "\(envId).bundle"]
+        let pgrepPipe = Pipe()
+        pgrepCheck.standardOutput = pgrepPipe
+        pgrepCheck.standardError = FileHandle.nullDevice
+        try? pgrepCheck.run()
+        pgrepCheck.waitUntilExit()
+        let pgrepOutput = String(data: pgrepPipe.fileHandleForReading.availableData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if pgrepCheck.terminationStatus == 0 && !pgrepOutput.isEmpty {
+            // QEMU process exists — adopt it (nil process = adopted)
+            qemuVMs[envId] = RunningQEMUVM(
+                process: nil,
+                bundlePath: bundlePath,
+                monitorSocketPath: monitorSocket,
+                sshHostPort: VMManager.nextQEMUSSHPort,
+                vncHostPort: VMManager.nextQEMUVNCPort
+            )
+            VMManager.nextQEMUSSHPort += 1
+            VMManager.nextQEMUVNCPort += 1
+            logger.info("adopted existing QEMU process for \(envId) (pid \(pgrepOutput))")
+            return
         }
 
         // Allocate host ports for SSH and VNC forwarding
@@ -367,17 +408,38 @@ final class VMManager {
 
         let memoryMB = max(memoryGB * 1024, 512)  // minimum 512MB
 
+        // ISO installs use SeaBIOS (OVMF times out under TCG emulation) + IDE.
+        // Template-based VMs use OVMF (UEFI) + virtio for better performance.
+        let installISOPath = "\(bundlePath)/install.iso"
+        let hasISO = FileManager.default.fileExists(atPath: installISOPath)
+
         var args = [
             "-machine", "q35",
             "-accel", "tcg",
             "-cpu", "max",
             "-smp", "\(cpuCount)",
             "-m", "\(memoryMB)M",
-            "-drive", "if=pflash,format=raw,readonly=on,file=\(firmwarePath)",
-            "-drive", "if=pflash,format=raw,file=\(efiVarsPath)",
-            "-drive", "file=\(diskPath),format=qcow2,if=virtio",
+        ]
+
+        if hasISO {
+            // SeaBIOS mode for ISO install
+            args += [
+                "-drive", "file=\(diskPath),format=qcow2,if=ide",
+                "-drive", "file=\(installISOPath),media=cdrom,index=1",
+                "-boot", "d",
+            ]
+        } else {
+            // UEFI mode for template-based VMs
+            args += [
+                "-drive", "if=pflash,format=raw,readonly=on,file=\(firmwarePath)",
+                "-drive", "if=pflash,format=raw,file=\(efiVarsPath)",
+                "-drive", "file=\(diskPath),format=qcow2,if=virtio",
+            ]
+        }
+
+        args += [
             "-netdev", "user,id=net0,hostfwd=tcp::\(sshPort)-:22",
-            "-device", "virtio-net-pci,netdev=net0",
+            "-device", "\(hasISO ? "e1000" : "virtio-net-pci"),netdev=net0",
             "-display", "none",
             "-vnc", "127.0.0.1:\(vncPort - 5900)",
             "-device", "virtio-gpu-pci",
@@ -386,15 +448,43 @@ final class VMManager {
             "-device", "virtio-rng-pci",
         ]
 
-        // Attach install ISO if present (for ISO-based installs)
-        let installISOPath = "\(bundlePath)/install.iso"
-        if FileManager.default.fileExists(atPath: installISOPath) {
-            args += ["-cdrom", installISOPath, "-boot", "d"]
-        }
-
         // Attach cloud-init ISO if present
         if FileManager.default.fileExists(atPath: ciISOPath) {
             args += ["-drive", "file=\(ciISOPath),format=raw,if=virtio,readonly=on"]
+        }
+
+        // Generate autounattend ISO for Windows install automation
+        if let opts = winInstallOptions, hasISO {
+            let xml = generateAutounattendXML(opts)
+            if !xml.isEmpty {
+                let unattendDir = "\(bundlePath)/unattend"
+                try FileManager.default.createDirectory(atPath: unattendDir, withIntermediateDirectories: true)
+                try xml.write(toFile: "\(unattendDir)/autounattend.xml", atomically: true, encoding: .utf8)
+
+                let unattendISO = "\(bundlePath)/autounattend.iso"
+                if !FileManager.default.fileExists(atPath: unattendISO) {
+                    let hdiutil = Process()
+                    hdiutil.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+                    hdiutil.arguments = ["makehybrid", "-o", unattendISO,
+                                         "-default-volume-name", "OEMDRV",
+                                         "-iso", "-joliet",
+                                         unattendDir]
+                    let errPipe = Pipe()
+                    hdiutil.standardOutput = FileHandle.nullDevice
+                    hdiutil.standardError = errPipe
+                    try hdiutil.run()
+                    hdiutil.waitUntilExit()
+                    if hdiutil.terminationStatus != 0 {
+                        let errMsg = String(data: errPipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+                        logger.warning("[\(envId)] hdiutil autounattend failed: \(errMsg)")
+                    }
+                }
+
+                if FileManager.default.fileExists(atPath: unattendISO) {
+                    args += ["-drive", "file=\(unattendISO),media=cdrom,index=2"]
+                    logger.info("[\(envId)] attached autounattend ISO")
+                }
+            }
         }
 
         let process = Process()
@@ -452,6 +542,204 @@ final class VMManager {
     }
 
     /// Send a command to a QEMU monitor socket.
+    private func generateAutounattendXML(_ opts: WinInstallOptions) -> String {
+        let arch = "amd64"
+        let token = "31bf3856ad364e35"
+        let lang = opts.language ?? "en-US"
+
+        // -- windowsPE pass --
+        var runSyncCmds = ""
+        var order = 1
+        let bypasses: [(Bool?, String)] = [
+            (opts.bypass_tpm, "BypassTPMCheck"),
+            (opts.bypass_secure_boot, "BypassSecureBootCheck"),
+            (opts.bypass_ram, "BypassRAMCheck"),
+            (opts.bypass_cpu, "BypassCPUCheck"),
+        ]
+        for (flag, name) in bypasses {
+            if flag == true {
+                runSyncCmds += """
+                    <RunSynchronousCommand wcm:action="add">
+                      <Order>\(order)</Order>
+                      <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v \(name) /t REG_DWORD /d 1 /f</Path>
+                    </RunSynchronousCommand>\n
+                """
+                order += 1
+            }
+        }
+
+        var setupComponent = ""
+        if !runSyncCmds.isEmpty {
+            setupComponent += "      <RunSynchronous>\n\(runSyncCmds)      </RunSynchronous>\n"
+        }
+        if opts.auto_partition == true {
+            setupComponent += """
+                  <DiskConfiguration>
+                    <Disk wcm:action="add">
+                      <DiskID>0</DiskID>
+                      <WillWipeDisk>true</WillWipeDisk>
+                      <CreatePartitions>
+                        <CreatePartition wcm:action="add">
+                          <Order>1</Order>
+                          <Type>Primary</Type>
+                        </CreatePartition>
+                      </CreatePartitions>
+                      <ModifyPartitions>
+                        <ModifyPartition wcm:action="add">
+                          <Order>1</Order>
+                          <PartitionID>1</PartitionID>
+                          <Format>NTFS</Format>
+                          <Label>Windows</Label>
+                          <Letter>C</Letter>
+                        </ModifyPartition>
+                      </ModifyPartitions>
+                    </Disk>
+                  </DiskConfiguration>
+                  <ImageInstall>
+                    <OSImage>
+                      <InstallTo>
+                        <DiskID>0</DiskID>
+                        <PartitionID>1</PartitionID>
+                      </InstallTo>
+                    </OSImage>
+                  </ImageInstall>\n
+            """
+        }
+        if let key = opts.product_key, !key.isEmpty {
+            setupComponent += """
+                  <UserData>
+                    <ProductKey>
+                      <Key>\(key)</Key>
+                    </ProductKey>
+                    <AcceptEula>true</AcceptEula>
+                  </UserData>\n
+            """
+        }
+
+        var windowsPE = ""
+        if !setupComponent.isEmpty {
+            windowsPE += """
+                <component name="Microsoft-Windows-Setup"
+                           processorArchitecture="\(arch)"
+                           publicKeyToken="\(token)"
+                           language="neutral"
+                           versionScope="nonSxS">
+            \(setupComponent)    </component>\n
+            """
+        }
+        // Language for WinPE
+        windowsPE += """
+              <component name="Microsoft-Windows-International-Core-WinPE"
+                         processorArchitecture="\(arch)"
+                         publicKeyToken="\(token)"
+                         language="neutral"
+                         versionScope="nonSxS">
+                <SetupUILanguage>
+                  <UILanguage>\(lang)</UILanguage>
+                </SetupUILanguage>
+                <InputLocale>\(lang)</InputLocale>
+                <SystemLocale>\(lang)</SystemLocale>
+                <UILanguage>\(lang)</UILanguage>
+                <UserLocale>\(lang)</UserLocale>
+              </component>\n
+        """
+
+        // -- specialize pass --
+        var specialize = ""
+        if let tz = opts.timezone, !tz.isEmpty {
+            specialize = """
+              <component name="Microsoft-Windows-Shell-Setup"
+                         processorArchitecture="\(arch)"
+                         publicKeyToken="\(token)"
+                         language="neutral"
+                         versionScope="nonSxS">
+                <TimeZone>\(tz)</TimeZone>
+              </component>\n
+            """
+        }
+
+        // -- oobeSystem pass --
+        var oobeInner = ""
+        if opts.skip_oobe == true {
+            oobeInner += """
+                <OOBE>
+                  <HideEULAPage>true</HideEULAPage>
+                  <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                  <ProtectYourPC>3</ProtectYourPC>
+                  <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                  <SkipMachineOOBE>true</SkipMachineOOBE>
+                  <SkipUserOOBE>true</SkipUserOOBE>
+                </OOBE>\n
+            """
+        }
+        if let username = opts.username, !username.isEmpty {
+            let password = opts.password ?? ""
+            oobeInner += """
+                <UserAccounts>
+                  <LocalAccounts>
+                    <LocalAccount wcm:action="add">
+                      <Name>\(username)</Name>
+                      <Group>Administrators</Group>
+                      <Password>
+                        <Value>\(password)</Value>
+                        <PlainText>true</PlainText>
+                      </Password>
+                    </LocalAccount>
+                  </LocalAccounts>
+                </UserAccounts>\n
+            """
+            if opts.auto_login == true {
+                oobeInner += """
+                    <AutoLogon>
+                      <Enabled>true</Enabled>
+                      <Username>\(username)</Username>
+                      <Password>
+                        <Value>\(password)</Value>
+                        <PlainText>true</PlainText>
+                      </Password>
+                      <LogonCount>1</LogonCount>
+                    </AutoLogon>\n
+                """
+            }
+        }
+
+        var oobeSystem = ""
+        if !oobeInner.isEmpty {
+            oobeSystem = """
+              <component name="Microsoft-Windows-Shell-Setup"
+                         processorArchitecture="\(arch)"
+                         publicKeyToken="\(token)"
+                         language="neutral"
+                         versionScope="nonSxS">
+            \(oobeInner)    </component>\n
+            """
+        }
+        // Language in oobeSystem
+        oobeSystem += """
+              <component name="Microsoft-Windows-International-Core"
+                         processorArchitecture="\(arch)"
+                         publicKeyToken="\(token)"
+                         language="neutral"
+                         versionScope="nonSxS">
+                <InputLocale>\(lang)</InputLocale>
+                <SystemLocale>\(lang)</SystemLocale>
+                <UILanguage>\(lang)</UILanguage>
+                <UserLocale>\(lang)</UserLocale>
+              </component>\n
+        """
+
+        var xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+        xml += "<unattend xmlns=\"urn:schemas-microsoft-com:unattend\"\n"
+        xml += "          xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\">\n"
+        xml += "  <settings pass=\"windowsPE\">\n\(windowsPE)  </settings>\n"
+        if !specialize.isEmpty {
+            xml += "  <settings pass=\"specialize\">\n\(specialize)  </settings>\n"
+        }
+        xml += "  <settings pass=\"oobeSystem\">\n\(oobeSystem)  </settings>\n"
+        xml += "</unattend>\n"
+        return xml
+    }
+
     private func sendQEMUMonitorCommand(socketPath: String, command: String) throws {
         let sock = socket(AF_UNIX, SOCK_STREAM, 0)
         guard sock >= 0 else { return }
@@ -492,8 +780,17 @@ final class VMManager {
         if let qemu = qemuVMs.removeValue(forKey: envId) {
             logger.info("destroying QEMU VM for environment \(envId)")
             try? sendQEMUMonitorCommand(socketPath: qemu.monitorSocketPath, command: "quit")
-            qemu.process.terminate()
-            qemu.process.waitUntilExit()
+            if let proc = qemu.process, proc.isRunning {
+                proc.terminate()
+                proc.waitUntilExit()
+            }
+            // Also kill any orphaned QEMU process for this env
+            let pkill = Process()
+            pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            pkill.arguments = ["-f", "\(envId).bundle"]
+            try? pkill.run()
+            pkill.waitUntilExit()
+            try await Task.sleep(nanoseconds: 1_000_000_000)
             try FileManager.default.removeItem(atPath: qemu.bundlePath)
             logger.info("QEMU VM destroyed for environment \(envId)")
             return
@@ -736,7 +1033,18 @@ final class VMManager {
     func vmState(envId: String) -> VZVirtualMachine.State? {
         // QEMU VMs report as "running" if the process is alive
         if let qemu = qemuVMs[envId] {
-            return qemu.process.isRunning ? .running : .stopped
+            if let proc = qemu.process {
+                return proc.isRunning ? .running : .stopped
+            }
+            // Adopted process — check if QEMU is still running via pgrep
+            let pgrep = Process()
+            pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            pgrep.arguments = ["-f", "\(envId).bundle"]
+            pgrep.standardOutput = FileHandle.nullDevice
+            pgrep.standardError = FileHandle.nullDevice
+            try? pgrep.run()
+            pgrep.waitUntilExit()
+            return pgrep.terminationStatus == 0 ? .running : .stopped
         }
         return vms[envId]?.vm.state
     }

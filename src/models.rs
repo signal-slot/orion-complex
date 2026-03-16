@@ -75,6 +75,8 @@ pub struct Environment {
     pub vnc_port: Option<i64>,
     pub iso_url: Option<String>,
     pub capture_image_id: Option<String>,
+    pub bypass_hw_check: i64,
+    pub win_install_options: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -144,6 +146,7 @@ pub struct CreateEnvironmentRequest {
     pub vcpus: Option<i64>,
     pub memory_bytes: Option<i64>,
     pub disk_bytes: Option<i64>,
+    pub win_install_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -195,6 +195,22 @@ export interface CreateEnvironmentRequest {
   vcpus?: number;
   memory_bytes?: number;
   disk_bytes?: number;
+  win_install_options?: WinInstallOptions;
+}
+
+export interface WinInstallOptions {
+  bypass_tpm?: boolean;
+  bypass_secure_boot?: boolean;
+  bypass_ram?: boolean;
+  bypass_cpu?: boolean;
+  language?: string;
+  timezone?: string;
+  username?: string;
+  password?: string;
+  auto_login?: boolean;
+  auto_partition?: boolean;
+  product_key?: string;
+  skip_oobe?: boolean;
 }
 
 export interface MigrateRequest {

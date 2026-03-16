@@ -441,6 +441,16 @@ export async function uploadIso(
   });
 }
 
+export async function updateIsoUrl(
+  envId: string,
+  isoUrl: string,
+): Promise<Environment> {
+  return request<Environment>(`/v1/environments/${envId}/iso-url`, {
+    method: "PUT",
+    body: JSON.stringify({ iso_url: isoUrl }),
+  });
+}
+
 export async function captureImage(
   envId: string,
   name: string,
@@ -591,6 +601,7 @@ export const api = {
   restartEnvironment,
   migrateEnvironment,
   uploadIso,
+  updateIsoUrl,
   captureImage,
   renameEnvironment,
   togglePortForwarding,

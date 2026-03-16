@@ -1,0 +1,1 @@
+ALTER TABLE environments ADD COLUMN bypass_hw_check INTEGER NOT NULL DEFAULT 0;

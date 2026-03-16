@@ -301,9 +301,14 @@ async fn create_environment(
         name
     };
 
+    let win_opts_json = req
+        .win_install_options
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+
     sqlx::query(
-        "INSERT INTO environments (id, name, image_id, iso_url, owner_user_id, node_id, provider, guest_os, guest_arch, state, created_at, expires_at, vcpus, memory_bytes, disk_bytes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?)",
+        "INSERT INTO environments (id, name, image_id, iso_url, owner_user_id, node_id, provider, guest_os, guest_arch, state, created_at, expires_at, vcpus, memory_bytes, disk_bytes, win_install_options)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&name)
@@ -319,6 +324,7 @@ async fn create_environment(
     .bind(vcpus)
     .bind(memory_bytes)
     .bind(disk_bytes)
+    .bind(&win_opts_json)
     .execute(&state.db)
     .await?;
 

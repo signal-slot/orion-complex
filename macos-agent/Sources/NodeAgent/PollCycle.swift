@@ -74,7 +74,6 @@ enum NodeAgentHelpers {
                                     }
                                 }
                                 FileManager.default.createFile(atPath: "\(bundlePath)/installed", contents: nil)
-                                try await vmManager.createVM(envId: env.id, guestOS: guestOS, guestArch: guestArch)
                             } else if let imageId = env.image_id, templateManager.hasTemplate(imageId: imageId, guestOS: "linux") {
                                 // Clone from a pre-registered template
                                 if isQEMU {
@@ -155,7 +154,12 @@ enum NodeAgentHelpers {
                                 logger.info("[\(env.id)] cloud-init seed written: \(sshKeys.count) SSH key(s), hostname=\(hostname)")
                             }
 
-                            try await vmManager.createVM(envId: env.id, guestOS: guestOS, guestArch: guestArch)
+                            let winOpts: VMManager.WinInstallOptions? = {
+                                guard let json = env.win_install_options,
+                                      let data = json.data(using: .utf8) else { return nil }
+                                return try? JSONDecoder().decode(VMManager.WinInstallOptions.self, from: data)
+                            }()
+                            try await vmManager.createVM(envId: env.id, guestOS: guestOS, guestArch: guestArch, winInstallOptions: winOpts)
                         } else {
                             // macOS guest: IPSW restore or golden image clone
                             if !ipswRestore.isInstalled(bundlePath: bundlePath) {
@@ -508,6 +512,23 @@ enum NodeAgentHelpers {
         api: APIClient,
         logger: Logger
     ) async {
+        // QEMU VMs bind to 127.0.0.1 with host-side ports — no IP discovery needed
+        if vmManager.isQEMUVM(envId: envId) {
+            let sshPort = vmManager.qemuSSHPort(envId: envId) ?? 12022
+            let vncPort = vmManager.qemuVNCPort(envId: envId) ?? 15950
+            let _ = try? await api.updateEndpoints(
+                envId: envId,
+                endpoints: .init(
+                    ssh_host: "127.0.0.1",
+                    ssh_port: sshPort,
+                    vnc_host: "127.0.0.1",
+                    vnc_port: vncPort
+                )
+            )
+            logger.info("[\(envId)] QEMU endpoints: SSH=127.0.0.1:\(sshPort), VNC=127.0.0.1:\(vncPort)")
+            return
+        }
+
         var vmIP: String?
 
         // Try MAC-based discovery first

@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
-import type { Image, Node } from "@/lib/types";
+import type { Image, Node, WinInstallOptions } from "@/lib/types";
 
 const MEMORY_OPTIONS = [
   { label: "4 GB", value: 4 * 1024 * 1024 * 1024 },
@@ -37,6 +37,20 @@ export default function NewEnvironmentPage() {
   const [uploading, setUploading] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
   const [guestOs, setGuestOs] = useState("windows");
+  const [winOpts, setWinOpts] = useState<WinInstallOptions>({
+    bypass_tpm: true,
+    bypass_secure_boot: true,
+    bypass_ram: true,
+    bypass_cpu: true,
+    language: "en-US",
+    timezone: "",
+    username: "",
+    password: "",
+    auto_login: false,
+    auto_partition: false,
+    product_key: "",
+    skip_oobe: false,
+  });
   const [vcpus, setVcpus] = useState(4);
   const [memoryBytes, setMemoryBytes] = useState(MEMORY_OPTIONS[1].value);
   const [diskBytes, setDiskBytes] = useState(DISK_OPTIONS[1].value);
@@ -82,17 +96,14 @@ export default function NewEnvironmentPage() {
           memory_bytes: memoryBytes,
           disk_bytes: diskBytes,
           ttl_seconds: ttlSeconds,
+          win_install_options: guestOs === "windows" ? winOpts : undefined,
         });
 
         if (isoFile) {
           setUploading(true);
           setUploadPct(0);
           const result = await api.uploadIso(isoFile, setUploadPct);
-          await fetch(`/v1/environments/${env.id}/iso-url`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${localStorage.getItem("auth_token")}` },
-            body: JSON.stringify({ iso_url: result.path }),
-          });
+          await api.updateIsoUrl(env.id, result.path);
           setUploading(false);
         }
 
@@ -140,10 +151,11 @@ export default function NewEnvironmentPage() {
       )}
 
       {/* Mode Toggle */}
-      <div className="flex rounded-lg border border-zinc-700 overflow-hidden">
+      <div className={`flex rounded-lg border border-zinc-700 overflow-hidden ${submitting ? "opacity-60 pointer-events-none" : ""}`}>
         <button
           type="button"
           onClick={() => setMode("image")}
+          disabled={submitting}
           className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
             mode === "image"
               ? "bg-indigo-600 text-white"
@@ -155,6 +167,7 @@ export default function NewEnvironmentPage() {
         <button
           type="button"
           onClick={() => setMode("iso")}
+          disabled={submitting}
           className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
             mode === "iso"
               ? "bg-indigo-600 text-white"
@@ -166,6 +179,7 @@ export default function NewEnvironmentPage() {
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-5">
+       <fieldset disabled={submitting} className="space-y-5 disabled:opacity-60">
         {/* Name */}
         <div>
           <label htmlFor="name" className="block text-sm font-medium text-zinc-300 mb-1.5">
@@ -262,6 +276,86 @@ export default function NewEnvironmentPage() {
                 <option value="linux">Linux</option>
               </select>
             </div>
+            {guestOs === "windows" && (
+              <div className="space-y-4 rounded-lg border border-zinc-700 bg-zinc-800/50 p-4">
+                <h3 className="text-sm font-medium text-zinc-300">Windows Install Options</h3>
+
+                {/* Hardware Bypass */}
+                <fieldset className="space-y-1.5">
+                  <legend className="text-xs text-zinc-500 mb-1">Hardware Requirement Bypass</legend>
+                  {([
+                    ["bypass_tpm", "TPM"],
+                    ["bypass_secure_boot", "Secure Boot"],
+                    ["bypass_ram", "RAM"],
+                    ["bypass_cpu", "CPU"],
+                  ] as const).map(([key, label]) => (
+                    <WinCheckbox key={key} label={label} checked={!!winOpts[key]}
+                      onChange={(v) => setWinOpts({ ...winOpts, [key]: v })} />
+                  ))}
+                </fieldset>
+
+                {/* Language / Timezone */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-zinc-500 mb-1">Language</label>
+                    <select value={winOpts.language} onChange={(e) => setWinOpts({ ...winOpts, language: e.target.value })} className={inputClass}>
+                      <option value="en-US">English (US)</option>
+                      <option value="en-GB">English (UK)</option>
+                      <option value="ja-JP">Japanese</option>
+                      <option value="zh-CN">Chinese (Simplified)</option>
+                      <option value="zh-TW">Chinese (Traditional)</option>
+                      <option value="ko-KR">Korean</option>
+                      <option value="de-DE">German</option>
+                      <option value="fr-FR">French</option>
+                      <option value="es-ES">Spanish</option>
+                      <option value="pt-BR">Portuguese (Brazil)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-zinc-500 mb-1">Timezone</label>
+                    <select value={winOpts.timezone} onChange={(e) => setWinOpts({ ...winOpts, timezone: e.target.value })} className={inputClass}>
+                      <option value="">Default</option>
+                      <option value="Tokyo Standard Time">Tokyo (JST)</option>
+                      <option value="Pacific Standard Time">Pacific (PST)</option>
+                      <option value="Eastern Standard Time">Eastern (EST)</option>
+                      <option value="Central Standard Time">Central (CST)</option>
+                      <option value="Mountain Standard Time">Mountain (MST)</option>
+                      <option value="GMT Standard Time">London (GMT)</option>
+                      <option value="Central European Standard Time">Central Europe (CET)</option>
+                      <option value="China Standard Time">China (CST)</option>
+                      <option value="Korea Standard Time">Korea (KST)</option>
+                      <option value="UTC">UTC</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* User Account */}
+                <fieldset className="space-y-2">
+                  <legend className="text-xs text-zinc-500 mb-1">User Account</legend>
+                  <div className="grid grid-cols-2 gap-3">
+                    <input type="text" placeholder="Username" value={winOpts.username}
+                      onChange={(e) => setWinOpts({ ...winOpts, username: e.target.value })} className={inputClass} />
+                    <input type="password" placeholder="Password" value={winOpts.password}
+                      onChange={(e) => setWinOpts({ ...winOpts, password: e.target.value })} className={inputClass} />
+                  </div>
+                  <WinCheckbox label="Auto-login" checked={!!winOpts.auto_login}
+                    onChange={(v) => setWinOpts({ ...winOpts, auto_login: v })} />
+                </fieldset>
+
+                {/* Partition / Product Key / OOBE */}
+                <div className="space-y-1.5">
+                  <WinCheckbox label="Auto-partition disk" checked={!!winOpts.auto_partition}
+                    onChange={(v) => setWinOpts({ ...winOpts, auto_partition: v })} />
+                  <WinCheckbox label="Skip OOBE (initial setup wizard)" checked={!!winOpts.skip_oobe}
+                    onChange={(v) => setWinOpts({ ...winOpts, skip_oobe: v })} />
+                </div>
+                <div>
+                  <label className="block text-xs text-zinc-500 mb-1">Product Key (optional)</label>
+                  <input type="text" placeholder="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX" value={winOpts.product_key}
+                    onChange={(e) => setWinOpts({ ...winOpts, product_key: e.target.value })} className={inputClass} />
+                </div>
+              </div>
+            )}
           </>
         )}
 
@@ -343,7 +437,26 @@ export default function NewEnvironmentPage() {
         >
           {submitting ? "Creating..." : "Create Machine"}
         </button>
+       </fieldset>
       </form>
     </div>
+  );
+}
+
+function WinCheckbox({ label, checked, onChange }: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex items-center gap-2 cursor-pointer">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="rounded border-zinc-600 bg-zinc-800 text-indigo-500 focus:ring-indigo-500 focus:ring-offset-0"
+      />
+      <span className="text-sm text-zinc-300">{label}</span>
+    </label>
   );
 }
