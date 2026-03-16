@@ -152,6 +152,43 @@ enum NodeAgentHelpers {
                                 }
 
                                 logger.info("[\(env.id)] cloud-init seed written: \(sshKeys.count) SSH key(s), hostname=\(hostname)")
+
+                                // Build cidata ISO for cloud-init NoCloud datasource
+                                let cidataPath = "\(bundlePath)/cidata.iso"
+                                if !FileManager.default.fileExists(atPath: cidataPath) {
+                                    // Also write network-config for DHCP
+                                    let networkConfig = """
+                                    version: 2
+                                    ethernets:
+                                      id0:
+                                        match:
+                                          driver: virtio_net
+                                        dhcp4: true
+                                    """
+                                    try networkConfig.write(
+                                        toFile: "\(sharedPath)/network-config",
+                                        atomically: true,
+                                        encoding: .utf8
+                                    )
+
+                                    let hdiutil = Process()
+                                    hdiutil.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+                                    hdiutil.arguments = [
+                                        "makehybrid", "-o", cidataPath,
+                                        "-default-volume-name", "cidata",
+                                        "-joliet", "-iso",
+                                        sharedPath
+                                    ]
+                                    hdiutil.standardOutput = FileHandle.nullDevice
+                                    hdiutil.standardError = FileHandle.nullDevice
+                                    try hdiutil.run()
+                                    hdiutil.waitUntilExit()
+                                    if hdiutil.terminationStatus == 0 {
+                                        logger.info("[\(env.id)] cidata ISO created")
+                                    } else {
+                                        logger.warning("[\(env.id)] failed to create cidata ISO")
+                                    }
+                                }
                             }
 
                             let winOpts: VMManager.WinInstallOptions? = {

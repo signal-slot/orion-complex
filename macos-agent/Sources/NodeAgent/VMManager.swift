@@ -259,12 +259,24 @@ final class VMManager {
             VZVirtualMachineConfiguration.minimumAllowedMemorySize
         )
 
-        // Storage
+        // Storage: main disk + cloud-init cidata ISO if present
         let diskAttachment = try VZDiskImageStorageDeviceAttachment(
             url: URL(fileURLWithPath: diskPath),
             readOnly: false
         )
-        config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)]
+        var linuxStorageDevices: [VZStorageDeviceConfiguration] = [
+            VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)
+        ]
+        let cidataPath = "\(bundlePath)/cidata.iso"
+        if FileManager.default.fileExists(atPath: cidataPath) {
+            let cidataAttachment = try VZDiskImageStorageDeviceAttachment(
+                url: URL(fileURLWithPath: cidataPath),
+                readOnly: true
+            )
+            linuxStorageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: cidataAttachment))
+            logger.info("attached cidata ISO for cloud-init")
+        }
+        config.storageDevices = linuxStorageDevices
 
         // Network (NAT) — persist MAC address so DHCP lease survives VM restarts
         let networkConfig = VZVirtioNetworkDeviceConfiguration()
@@ -304,6 +316,18 @@ final class VMManager {
             directory: VZSharedDirectory(url: URL(fileURLWithPath: sharedPath), readOnly: false)
         )
         config.directorySharingDevices = [sharedDir]
+
+        // Serial console — write boot output to log file for debugging
+        let serialLogPath = "\(bundlePath)/console.log"
+        FileManager.default.createFile(atPath: serialLogPath, contents: nil)
+        if let serialLog = FileHandle(forWritingAtPath: serialLogPath) {
+            let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+            serialPort.attachment = VZFileHandleSerialPortAttachment(
+                fileHandleForReading: nil,
+                fileHandleForWriting: serialLog
+            )
+            config.serialPorts = [serialPort]
+        }
 
         try config.validate()
 
