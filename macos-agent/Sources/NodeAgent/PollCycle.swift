@@ -200,23 +200,28 @@ enum NodeAgentHelpers {
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM running")
 
-                        // Set up port forwarding if enabled, otherwise report internal IP
+                        // Set up port forwarding / endpoints in background (don't block poll loop)
+                        let createdEnvId = env.id
                         if env.port_forwarding == 1 {
-                            await setupPortForwarding(
-                                envId: env.id,
-                                vmManager: vmManager,
-                                portForwarder: portForwarder,
-                                api: api,
-                                logger: logger
-                            )
+                            Task {
+                                await setupPortForwarding(
+                                    envId: createdEnvId,
+                                    vmManager: vmManager,
+                                    portForwarder: portForwarder,
+                                    api: api,
+                                    logger: logger
+                                )
+                            }
                         } else {
-                            await reportVMInternalEndpoints(
-                                envId: env.id,
-                                vmManager: vmManager,
-                                portForwarder: portForwarder,
-                                api: api,
-                                logger: logger
-                            )
+                            Task {
+                                await reportVMInternalEndpoints(
+                                    envId: createdEnvId,
+                                    vmManager: vmManager,
+                                    portForwarder: portForwarder,
+                                    api: api,
+                                    logger: logger
+                                )
+                            }
                         }
                     } catch {
                         logger.error("[\(env.id)] failed to create VM: \(error)")
@@ -241,23 +246,27 @@ enum NodeAgentHelpers {
                         try await vmManager.resumeVM(envId: env.id)
                         let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
                         logger.info("[\(env.id)] VM resumed")
-                        // Re-establish port forwarding if enabled, otherwise report internal IP
+                        let resumedEnvId = env.id
                         if env.port_forwarding == 1 {
-                            await setupPortForwarding(
-                                envId: env.id,
-                                vmManager: vmManager,
-                                portForwarder: portForwarder,
-                                api: api,
-                                logger: logger
-                            )
+                            Task {
+                                await setupPortForwarding(
+                                    envId: resumedEnvId,
+                                    vmManager: vmManager,
+                                    portForwarder: portForwarder,
+                                    api: api,
+                                    logger: logger
+                                )
+                            }
                         } else {
-                            await reportVMInternalEndpoints(
-                                envId: env.id,
-                                vmManager: vmManager,
-                                portForwarder: portForwarder,
-                                api: api,
-                                logger: logger
-                            )
+                            Task {
+                                await reportVMInternalEndpoints(
+                                    envId: resumedEnvId,
+                                    vmManager: vmManager,
+                                    portForwarder: portForwarder,
+                                    api: api,
+                                    logger: logger
+                                )
+                            }
                         }
                     } catch {
                         logger.error("[\(env.id)] failed to resume: \(error)")
@@ -336,23 +345,27 @@ enum NodeAgentHelpers {
                                 try await vmManager.createVM(envId: env.id, guestOS: guestOS, guestArch: guestArch)
                                 logger.info("[\(env.id)] VM auto-recovered successfully")
 
-                                // Set up port forwarding if enabled, otherwise report internal IP
+                                let recoveredEnvId = env.id
                                 if env.port_forwarding == 1 {
-                                    await setupPortForwarding(
-                                        envId: env.id,
-                                        vmManager: vmManager,
-                                        portForwarder: portForwarder,
-                                        api: api,
-                                        logger: logger
-                                    )
+                                    Task {
+                                        await setupPortForwarding(
+                                            envId: recoveredEnvId,
+                                            vmManager: vmManager,
+                                            portForwarder: portForwarder,
+                                            api: api,
+                                            logger: logger
+                                        )
+                                    }
                                 } else {
-                                    await reportVMInternalEndpoints(
-                                        envId: env.id,
-                                        vmManager: vmManager,
-                                        portForwarder: portForwarder,
-                                        api: api,
-                                        logger: logger
-                                    )
+                                    Task {
+                                        await reportVMInternalEndpoints(
+                                            envId: recoveredEnvId,
+                                            vmManager: vmManager,
+                                            portForwarder: portForwarder,
+                                            api: api,
+                                            logger: logger
+                                        )
+                                    }
                                 }
                             } catch {
                                 logger.error("[\(env.id)] auto-recovery failed: \(error) — marking as failed")
@@ -388,33 +401,36 @@ enum NodeAgentHelpers {
                         }
                     }
 
-                    // Manage port forwarding based on the flag
-                    if env.port_forwarding == 1 {
-                        // Port forwarding enabled — ensure it's active
-                        if !portForwarder.isForwarding(envId: env.id) {
+                    // Manage port forwarding / endpoint reporting (non-blocking)
+                    // Run in a detached task so it doesn't block the poll loop
+                    let envId = env.id
+                    let pfEnabled = env.port_forwarding == 1
+                    let needsEndpoints = env.ssh_host == nil || env.vnc_host == nil
+                    if pfEnabled && !portForwarder.isForwarding(envId: envId) {
+                        Task {
                             await setupPortForwarding(
-                                envId: env.id,
+                                envId: envId,
                                 vmManager: vmManager,
                                 portForwarder: portForwarder,
                                 api: api,
                                 logger: logger
                             )
                         }
-                    } else {
-                        // Port forwarding disabled — stop if active
-                        if portForwarder.isForwarding(envId: env.id) {
-                            portForwarder.stopForwarding(envId: env.id)
-                            logger.info("[\(env.id)] port forwarding stopped (disabled by user)")
+                    } else if !pfEnabled {
+                        if portForwarder.isForwarding(envId: envId) {
+                            portForwarder.stopForwarding(envId: envId)
+                            logger.info("[\(envId)] port forwarding stopped (disabled by user)")
                         }
-                        // Report VM internal IP so the backend WebSocket proxy can reach the VM
-                        if env.ssh_host == nil || env.vnc_host == nil {
-                            await reportVMInternalEndpoints(
-                                envId: env.id,
-                                vmManager: vmManager,
-                                portForwarder: portForwarder,
-                                api: api,
-                                logger: logger
-                            )
+                        if needsEndpoints {
+                            Task {
+                                await reportVMInternalEndpoints(
+                                    envId: envId,
+                                    vmManager: vmManager,
+                                    portForwarder: portForwarder,
+                                    api: api,
+                                    logger: logger
+                                )
+                            }
                         }
                     }
 
@@ -478,6 +494,17 @@ enum NodeAgentHelpers {
             let hostname = "orion-\(shortId)"
             logger.info("[\(envId)] trying hostname resolution for \(hostname)")
             vmIP = await portForwarder.discoverVMIPByHostname(hostname: hostname, retries: 10, interval: 2)
+        }
+
+        if vmIP == nil && !vmManager.isQEMUVM(envId: envId) {
+            // VZ VM has no IP — reboot to re-trigger DHCP
+            logger.warning("[\(envId)] VM IP not found, rebooting VM to re-acquire network")
+            try? await vmManager.rebootVM(envId: envId, force: true)
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            // Retry discovery after reboot
+            if let macAddress = vmManager.macAddress(envId: envId) {
+                vmIP = await portForwarder.discoverVMIP(macAddress: macAddress, retries: 15, interval: 2)
+            }
         }
 
         guard let vmIP = vmIP else {
@@ -544,8 +571,18 @@ enum NodeAgentHelpers {
             vmIP = await portForwarder.discoverVMIPByHostname(hostname: hostname, retries: 10, interval: 2)
         }
 
+        if vmIP == nil {
+            // VZ VM has no IP — reboot to re-trigger DHCP
+            logger.warning("[\(envId)] VM IP not found, rebooting VM to re-acquire network")
+            try? await vmManager.rebootVM(envId: envId, force: true)
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            if let macAddress = vmManager.macAddress(envId: envId) {
+                vmIP = await portForwarder.discoverVMIP(macAddress: macAddress, retries: 15, interval: 2)
+            }
+        }
+
         guard let vmIP = vmIP else {
-            logger.warning("[\(envId)] cannot report endpoints: VM IP not found")
+            logger.warning("[\(envId)] cannot report endpoints: VM IP not found after reboot")
             return
         }
 

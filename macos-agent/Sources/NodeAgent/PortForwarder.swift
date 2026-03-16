@@ -63,9 +63,25 @@ final class PortForwarder {
     func discoverVMIP(macAddress: String, retries: Int = 30, interval: TimeInterval = 2) async -> String? {
         let normalizedMAC = macAddress.lowercased()
         for attempt in 1...retries {
+            // Try DHCP lease file first
             if let ip = parseLeaseFileByMAC(normalizedMAC) {
                 logger.info("discovered VM IP \(ip) for MAC \(normalizedMAC) (attempt \(attempt))")
                 return ip
+            }
+            // Try ARP table as fallback
+            if let ip = parseARPTableByMAC(normalizedMAC) {
+                logger.info("discovered VM IP \(ip) for MAC \(normalizedMAC) via ARP (attempt \(attempt))")
+                return ip
+            }
+            // Ping broadcast to populate ARP table
+            if attempt == 1 || attempt % 5 == 0 {
+                let ping = Process()
+                ping.executableURL = URL(fileURLWithPath: "/sbin/ping")
+                ping.arguments = ["-c", "1", "-t", "1", "192.168.64.255"]
+                ping.standardOutput = FileHandle.nullDevice
+                ping.standardError = FileHandle.nullDevice
+                try? ping.run()
+                ping.waitUntilExit()
             }
             try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         }
@@ -111,10 +127,18 @@ final class PortForwarder {
         return nil
     }
 
+    /// Normalize a MAC address to lowercase with zero-padded octets (e.g. "3:1" → "03:01")
+    private func normalizeMAC(_ mac: String) -> String {
+        return mac.lowercased().split(separator: ":").map { octet in
+            octet.count == 1 ? "0\(octet)" : String(octet)
+        }.joined(separator: ":")
+    }
+
     private func parseLeaseFileByMAC(_ mac: String) -> String? {
         guard let content = try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8) else {
             return nil
         }
+        let normalizedTarget = normalizeMAC(mac)
         var currentIP: String?
         var currentMAC: String?
         for line in content.components(separatedBy: "\n") {
@@ -123,7 +147,7 @@ final class PortForwarder {
                 currentIP = nil
                 currentMAC = nil
             } else if trimmed == "}" {
-                if currentMAC == mac, let ip = currentIP {
+                if let currentMAC = currentMAC, normalizeMAC(currentMAC) == normalizedTarget, let ip = currentIP {
                     return ip
                 }
             } else if trimmed.hasPrefix("ip_address=") {
@@ -131,7 +155,36 @@ final class PortForwarder {
             } else if trimmed.hasPrefix("hw_address=") {
                 let hwAddr = String(trimmed.dropFirst("hw_address=".count))
                 let addrPart = hwAddr.contains(",") ? String(hwAddr.split(separator: ",").last ?? "") : hwAddr
-                currentMAC = addrPart.lowercased()
+                currentMAC = addrPart
+            }
+        }
+        return nil
+    }
+
+    /// Parse ARP table (`arp -a`) to find IP for a given MAC address.
+    private func parseARPTableByMAC(_ mac: String) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
+        proc.arguments = ["-a"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        try? proc.run()
+        proc.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+        let normalizedTarget = normalizeMAC(mac)
+        // Lines look like: ? (192.168.64.24) at 62:75:f8:a5:86:1d on bridge100 ...
+        for line in output.components(separatedBy: "\n") {
+            guard line.contains("at ") else { continue }
+            let parts = line.components(separatedBy: " at ")
+            guard parts.count >= 2 else { continue }
+            let afterAt = parts[1].components(separatedBy: " ").first ?? ""
+            if normalizeMAC(afterAt) == normalizedTarget {
+                // Extract IP from "(192.168.64.24)"
+                if let ipStart = parts[0].range(of: "("),
+                   let ipEnd = parts[0].range(of: ")") {
+                    return String(parts[0][ipStart.upperBound..<ipEnd.lowerBound])
+                }
             }
         }
         return nil

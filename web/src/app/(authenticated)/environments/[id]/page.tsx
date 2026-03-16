@@ -355,7 +355,12 @@ export default function EnvironmentDetailPage() {
                     </div>
                   </div>
                 ) : (
-                  <p className="text-sm text-zinc-500">Setting up port forwarding...</p>
+                  <div className="rounded-lg bg-zinc-800/50 border border-zinc-700/50 px-4 py-3">
+                    <p className="text-sm text-zinc-400">Setting up port forwarding...</p>
+                    <p className="text-xs text-zinc-500 mt-1">
+                      If this takes more than a minute, the VM may have failed to obtain an IP address. Try destroying and recreating the machine.
+                    </p>
+                  </div>
                 )
               ) : (
                 <div className="rounded-lg bg-zinc-800/50 border border-zinc-700/50 px-4 py-3">
@@ -390,7 +395,12 @@ export default function EnvironmentDetailPage() {
             ) : null}
             {/* Port-forwarded SSH endpoint (only when forwarding is on and endpoints are pending) */}
             {env.port_forwarding === 1 && !env.ssh_host && env.guest_os !== "macos" && (
-              <p className="text-sm text-zinc-500">Setting up port forwarding...</p>
+              <div className="rounded-lg bg-zinc-800/50 border border-zinc-700/50 px-4 py-3">
+                <p className="text-sm text-zinc-400">Setting up port forwarding...</p>
+                <p className="text-xs text-zinc-500 mt-1">
+                  If this takes more than a minute, the VM may have failed to obtain an IP address. Try destroying and recreating the machine.
+                </p>
+              </div>
             )}
           </div>
         </div>
