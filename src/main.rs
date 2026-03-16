@@ -45,6 +45,7 @@ async fn main() {
         http_client: reqwest::Client::new(),
         vm_provider,
         webauthn,
+        data_dir: config.data_dir.clone(),
     };
 
     // Reconcile environments stuck in transient states from a previous crash

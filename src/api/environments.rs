@@ -10,7 +10,7 @@ use crate::auth::AuthUser;
 use crate::error::AppError;
 use crate::events;
 use crate::models::{
-    CreateEnvironmentRequest, Environment, ExtendTtlRequest, MigrateRequest,
+    CaptureImageRequest, CreateEnvironmentRequest, Environment, ExtendTtlRequest, MigrateRequest,
     RenameEnvironmentRequest,
 };
 use crate::tasks;
@@ -65,6 +65,14 @@ pub fn routes() -> Router<AppState> {
             "/v1/environments/{env_id}/name",
             put(rename_environment),
         )
+        .route(
+            "/v1/environments/{env_id}/capture-image",
+            post(capture_image),
+        )
+        .route(
+            "/v1/environments/{env_id}/iso-url",
+            put(update_iso_url),
+        )
 }
 
 /// Returns true if the provider is managed by an external node agent (macOS)
@@ -87,7 +95,7 @@ async fn update_state(
 ) -> Result<Json<Environment>, AppError> {
     let valid_states = [
         "creating", "running", "suspending", "suspended", "resuming",
-        "rebooting", "migrating", "destroying", "failed",
+        "rebooting", "migrating", "destroying", "capturing", "failed",
     ];
     if !valid_states.contains(&req.state.as_str()) {
         return Err(AppError::BadRequest(format!(
@@ -160,14 +168,36 @@ async fn create_environment(
     user: AuthUser,
     Json(req): Json<CreateEnvironmentRequest>,
 ) -> Result<(StatusCode, Json<Environment>), AppError> {
-    // Verify image exists
-    let image = sqlx::query_as::<_, crate::models::Image>("SELECT * FROM images WHERE id = ?")
-        .bind(&req.image_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::BadRequest(format!("image {} not found", req.image_id)))?;
-
-    let provider = image.provider.as_deref().unwrap_or("libvirt");
+    // Determine provider/guest info from image or from explicit fields (ISO mode)
+    let (image_id, iso_url, provider, guest_os, guest_arch) = if let Some(ref img_id) = req.image_id
+    {
+        let image =
+            sqlx::query_as::<_, crate::models::Image>("SELECT * FROM images WHERE id = ?")
+                .bind(img_id)
+                .fetch_optional(&state.db)
+                .await?
+                .ok_or_else(|| AppError::BadRequest(format!("image {img_id} not found")))?;
+        (
+            Some(img_id.clone()),
+            None::<String>,
+            image.provider.unwrap_or_else(|| "libvirt".into()),
+            image.guest_os.unwrap_or_else(|| "linux".into()),
+            image.guest_arch.unwrap_or_else(|| "x86_64".into()),
+        )
+    } else if let Some(ref url) = req.iso_url {
+        // ISO-based creation: no base image, QEMU x86_64
+        (
+            None,
+            Some(url.clone()),
+            "virtualization".to_string(),
+            req.guest_os.clone().unwrap_or_else(|| "windows".into()),
+            req.guest_arch.clone().unwrap_or_else(|| "x86_64".into()),
+        )
+    } else {
+        return Err(AppError::BadRequest(
+            "either image_id or iso_url is required".into(),
+        ));
+    };
 
     let vcpus = req.vcpus.unwrap_or(DEFAULT_VCPUS);
     let memory_bytes = req.memory_bytes.unwrap_or(DEFAULT_MEMORY_BYTES);
@@ -189,13 +219,12 @@ async fn create_environment(
         }
         None => {
             // Scheduler: pick first online node matching host_os + under capacity limits
-            let host_os_filter = if is_agent_managed(provider) {
+            let host_os_filter = if is_agent_managed(&provider) {
                 "macos"
             } else {
                 "linux"
             };
-            let guest_arch = image.guest_arch.as_deref().unwrap_or("x86_64");
-            let is_agent: i32 = if is_agent_managed(provider) { 1 } else { 0 };
+            let is_agent: i32 = if is_agent_managed(&provider) { 1 } else { 0 };
             sqlx::query_as::<_, crate::models::Node>(
                 "SELECT n.* FROM nodes n
                  WHERE n.online = 1
@@ -207,20 +236,20 @@ async fn create_environment(
                        < COALESCE(n.max_running_envs, 9999)
                    AND COALESCE((SELECT SUM(COALESCE(e.vcpus, 0)) FROM environments e
                         WHERE e.node_id = n.id AND e.state IN ('creating', 'running', 'suspending', 'resuming', 'rebooting')), 0) + ?
-                       <= n.cpu_cores * COALESCE(n.max_cpu_utilization_ratio, 0.7)
+                       <= n.cpu_cores * COALESCE(n.max_cpu_utilization_ratio, 2.0)
                    AND COALESCE((SELECT SUM(COALESCE(e.memory_bytes, 0)) FROM environments e
                         WHERE e.node_id = n.id AND e.state IN ('creating', 'running', 'suspending', 'resuming', 'rebooting')), 0) + ?
-                       <= n.memory_bytes * COALESCE(n.max_memory_utilization_ratio, 0.6)
+                       <= n.memory_bytes * COALESCE(n.max_memory_utilization_ratio, 0.95)
                    AND COALESCE((SELECT SUM(COALESCE(e.disk_bytes, 0)) FROM environments e
                         WHERE e.node_id = n.id AND e.state IN ('creating', 'running', 'suspending', 'resuming', 'rebooting')), 0) + ?
-                       <= n.disk_bytes_total * COALESCE(n.max_disk_utilization_ratio, 0.8)
+                       <= n.disk_bytes_total * COALESCE(n.max_disk_utilization_ratio, 0.95)
                  LIMIT 1",
             )
             .bind(host_os_filter)
-            .bind(guest_arch)
-            .bind(guest_arch)
+            .bind(&guest_arch)
+            .bind(&guest_arch)
             .bind(is_agent)
-            .bind(guest_arch)
+            .bind(&guest_arch)
             .bind(vcpus)
             .bind(memory_bytes)
             .bind(disk_bytes)
@@ -239,27 +268,52 @@ async fn create_environment(
 
     let expires_at = req.ttl_seconds.map(|ttl| now + ttl);
 
-    // Generate a default name from image name + short ID suffix if not provided
+    // Generate a default name
     let name = req.name.unwrap_or_else(|| {
-        let img_name = image
-            .name
-            .as_deref()
-            .unwrap_or("env");
-        format!("{}-{}", img_name, &id[..8])
+        if iso_url.is_some() {
+            format!("{}-install-{}", guest_os, &id[..8])
+        } else {
+            // image_id path — look up image name from DB (already fetched above)
+            format!("env-{}", &id[..8])
+        }
     });
+    // For image-based creation, use image name if available
+    let name = if iso_url.is_none() && name.starts_with("env-") {
+        if let Some(ref img_id) = image_id {
+            let img =
+                sqlx::query_as::<_, crate::models::Image>("SELECT * FROM images WHERE id = ?")
+                    .bind(img_id)
+                    .fetch_optional(&state.db)
+                    .await?;
+            if let Some(img) = img {
+                if let Some(ref img_name) = img.name {
+                    format!("{}-{}", img_name, &id[..8])
+                } else {
+                    name
+                }
+            } else {
+                name
+            }
+        } else {
+            name
+        }
+    } else {
+        name
+    };
 
     sqlx::query(
-        "INSERT INTO environments (id, name, image_id, owner_user_id, node_id, provider, guest_os, guest_arch, state, created_at, expires_at, vcpus, memory_bytes, disk_bytes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?)",
+        "INSERT INTO environments (id, name, image_id, iso_url, owner_user_id, node_id, provider, guest_os, guest_arch, state, created_at, expires_at, vcpus, memory_bytes, disk_bytes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&name)
-    .bind(&req.image_id)
+    .bind(&image_id)
+    .bind(&iso_url)
     .bind(&user.0.id)
     .bind(&node.id)
-    .bind(&image.provider)
-    .bind(&image.guest_os)
-    .bind(&image.guest_arch)
+    .bind(&provider)
+    .bind(&guest_os)
+    .bind(&guest_arch)
     .bind(now)
     .bind(expires_at)
     .bind(vcpus)
@@ -281,7 +335,7 @@ async fn create_environment(
 
     // Only dispatch in-process for libvirt provider.
     // macOS environments stay in "creating" state until the node agent picks them up.
-    if !is_agent_managed(provider) {
+    if !is_agent_managed(&provider) {
         // Fetch user's SSH keys for injection into the VM
         let ssh_keys: Vec<String> = sqlx::query_as::<_, crate::models::UserSshKey>(
             "SELECT * FROM user_ssh_keys WHERE user_id = ?",
@@ -301,15 +355,29 @@ async fn create_environment(
         let vm_provider = state.vm_provider.clone();
         let db = state.db.clone();
         let env_id_clone = id.clone();
+        let guest_os_clone = guest_os.clone();
+        let guest_arch_clone = guest_arch.clone();
+        let node_name = node.name.clone().unwrap_or_default();
+        // Look up image name for libvirt
+        let image_name = if let Some(ref img_id) = image_id {
+            sqlx::query_as::<_, crate::models::Image>("SELECT * FROM images WHERE id = ?")
+                .bind(img_id)
+                .fetch_optional(&state.db)
+                .await?
+                .and_then(|i| i.name)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         tokio::spawn(async move {
             let _ = tasks::update_task_state(&db, &task_id, "running").await;
 
             let params = VmCreateParams {
                 env_id: env_id_clone.clone(),
-                image_name: image.name.unwrap_or_default(),
-                guest_os: image.guest_os.unwrap_or_default(),
-                guest_arch: image.guest_arch.unwrap_or_default(),
-                node_host: node.name.unwrap_or_default(),
+                image_name,
+                guest_os: guest_os_clone,
+                guest_arch: guest_arch_clone,
+                node_host: node_name,
                 vcpus,
                 memory_bytes,
                 disk_bytes,
@@ -375,7 +443,16 @@ async fn destroy_environment(
     let env = fetch_env(&state, &env_id).await?;
     check_env_owner(&user.0, &env)?;
 
-    let old_state = env.state.clone();
+    let current = env.state.as_deref().unwrap_or("");
+
+    // If already destroying, the agent is confirming deletion — remove from DB
+    if current == "destroying" {
+        sqlx::query("DELETE FROM environments WHERE id = ?")
+            .bind(&env_id)
+            .execute(&state.db)
+            .await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
 
     sqlx::query("UPDATE environments SET state = 'destroying' WHERE id = ?")
         .bind(&env_id)
@@ -386,7 +463,7 @@ async fn destroy_environment(
         &state.db,
         &env_id,
         "state_change",
-        old_state.as_deref(),
+        Some(current),
         Some("destroying"),
         Some(&user.0.id),
         None,
@@ -597,6 +674,99 @@ async fn update_endpoints(
     .bind(&env_id)
     .execute(&state.db)
     .await?;
+
+    let env = sqlx::query_as::<_, Environment>("SELECT * FROM environments WHERE id = ?")
+        .bind(&env_id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Json(env))
+}
+
+async fn capture_image(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(env_id): Path<String>,
+    Json(req): Json<CaptureImageRequest>,
+) -> Result<(StatusCode, Json<crate::models::Image>), AppError> {
+    let env = fetch_env(&state, &env_id).await?;
+    check_env_owner(&user.0, &env)?;
+
+    let current = env.state.as_deref().unwrap_or("");
+    if !matches!(current, "running" | "suspended") {
+        return Err(AppError::BadRequest(format!(
+            "cannot capture image from environment in state '{current}'"
+        )));
+    }
+
+    let provider = env.provider.as_deref().unwrap_or("libvirt");
+    if !is_agent_managed(provider) {
+        return Err(AppError::BadRequest(
+            "image capture is only supported for agent-managed environments".into(),
+        ));
+    }
+
+    // Create the image record
+    let image_id = uuid::Uuid::new_v4().to_string();
+    let now = crate::unix_now();
+
+    sqlx::query(
+        "INSERT INTO images (id, name, provider, guest_os, guest_arch, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&image_id)
+    .bind(&req.name)
+    .bind(&env.provider)
+    .bind(&env.guest_os)
+    .bind(&env.guest_arch)
+    .bind(now)
+    .execute(&state.db)
+    .await?;
+
+    // Set the capture target on the environment and transition to capturing
+    let old_state = env.state.clone();
+    sqlx::query("UPDATE environments SET state = 'capturing', capture_image_id = ? WHERE id = ?")
+        .bind(&image_id)
+        .bind(&env_id)
+        .execute(&state.db)
+        .await?;
+
+    events::emit(
+        &state.db,
+        &env_id,
+        "state_change",
+        old_state.as_deref(),
+        Some("capturing"),
+        Some(&user.0.id),
+        Some(&format!("capturing as image '{}'", req.name)),
+    )
+    .await;
+
+    let image = sqlx::query_as::<_, crate::models::Image>("SELECT * FROM images WHERE id = ?")
+        .bind(&image_id)
+        .fetch_one(&state.db)
+        .await?;
+
+    Ok((StatusCode::CREATED, Json(image)))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateIsoUrlRequest {
+    iso_url: String,
+}
+
+async fn update_iso_url(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(env_id): Path<String>,
+    Json(req): Json<UpdateIsoUrlRequest>,
+) -> Result<Json<Environment>, AppError> {
+    let env = fetch_env(&state, &env_id).await?;
+    check_env_owner(&user.0, &env)?;
+
+    sqlx::query("UPDATE environments SET iso_url = ? WHERE id = ?")
+        .bind(&req.iso_url)
+        .bind(&env_id)
+        .execute(&state.db)
+        .await?;
 
     let env = sqlx::query_as::<_, Environment>("SELECT * FROM environments WHERE id = ?")
         .bind(&env_id)

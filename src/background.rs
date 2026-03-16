@@ -168,6 +168,12 @@ pub async fn reconcile_stuck_environments(db: &SqlitePool) {
     .unwrap_or_default();
 
     for env in &stuck {
+        let provider = env.provider.as_deref().unwrap_or("libvirt");
+        // Agent-managed environments are handled by the node agent, not the server.
+        // Don't mark them as failed — the agent will recover them.
+        if is_agent_managed(provider) {
+            continue;
+        }
         let state = env.state.as_deref().unwrap_or("");
         tracing::warn!(
             env_id = %env.id,

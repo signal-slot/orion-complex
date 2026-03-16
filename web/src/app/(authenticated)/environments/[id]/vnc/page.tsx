@@ -38,13 +38,13 @@ export default function VncPage() {
         const envData = await checkRes.json();
         if (cancelled) return;
         if (envData.state !== "running") {
-          throw new Error(`Environment is ${envData.state}, not running`);
+          throw new Error(`Machine is ${envData.state}, not running`);
         }
         if (envData.guest_os === "macos") {
           throw new Error("Browser VNC is not supported for macOS VMs (Apple Screen Sharing uses proprietary authentication). Use the native Screen Sharing app instead.");
         }
         if (envData.provider !== "libvirt" && !envData.vnc_host) {
-          throw new Error("VNC not available — the node agent has not configured port forwarding for this environment");
+          throw new Error("VNC not available — port forwarding has not been configured for this machine");
         }
 
         const RFB = await loadNoVNC();

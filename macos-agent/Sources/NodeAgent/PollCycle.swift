@@ -31,9 +31,52 @@ enum NodeAgentHelpers {
                     do {
                         let bundlePath = vmManager.bundlePath(envId: env.id)
 
-                        if guestOS == "linux" {
-                            // Linux guest: clone from a pre-registered template (cloud image)
-                            if let imageId = env.image_id, templateManager.hasTemplate(imageId: imageId, guestOS: "linux") {
+                        if guestOS != "macos" {
+                            if let isoURL = env.iso_url, !isoURL.isEmpty, isoURL != "pending-upload" {
+                                // ISO-based install: download or link ISO and create blank disk
+                                logger.info("[\(env.id)] ISO install from \(isoURL)")
+                                try FileManager.default.createDirectory(atPath: bundlePath, withIntermediateDirectories: true)
+                                let isoPath = "\(bundlePath)/install.iso"
+                                if !FileManager.default.fileExists(atPath: isoPath) {
+                                    if isoURL.hasPrefix("/") || isoURL.hasPrefix("file://") {
+                                        // Local file path — symlink to avoid copying large ISOs
+                                        let localPath = isoURL.hasPrefix("file://")
+                                            ? String(isoURL.dropFirst("file://".count))
+                                            : isoURL
+                                        guard FileManager.default.fileExists(atPath: localPath) else {
+                                            throw VMError.qemuStartFailed("ISO file not found: \(localPath)")
+                                        }
+                                        try FileManager.default.createSymbolicLink(atPath: isoPath, withDestinationPath: localPath)
+                                        logger.info("[\(env.id)] ISO linked from \(localPath)")
+                                    } else {
+                                        logger.info("[\(env.id)] downloading ISO...")
+                                        let proc = Process()
+                                        proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+                                        proc.arguments = ["-L", "-o", isoPath, isoURL]
+                                        try proc.run()
+                                        proc.waitUntilExit()
+                                        guard proc.terminationStatus == 0 else {
+                                            throw VMError.qemuStartFailed("ISO download failed (exit \(proc.terminationStatus))")
+                                        }
+                                        logger.info("[\(env.id)] ISO downloaded")
+                                    }
+                                }
+                                // Create blank qcow2 disk
+                                let diskPath = "\(bundlePath)/disk.img"
+                                if !FileManager.default.fileExists(atPath: diskPath) {
+                                    let qemuImg = Process()
+                                    qemuImg.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/qemu-img")
+                                    qemuImg.arguments = ["create", "-f", "qcow2", diskPath, "64G"]
+                                    try qemuImg.run()
+                                    qemuImg.waitUntilExit()
+                                    guard qemuImg.terminationStatus == 0 else {
+                                        throw VMError.diskCreationFailed(diskPath)
+                                    }
+                                }
+                                FileManager.default.createFile(atPath: "\(bundlePath)/installed", contents: nil)
+                                try await vmManager.createVM(envId: env.id, guestOS: guestOS, guestArch: guestArch)
+                            } else if let imageId = env.image_id, templateManager.hasTemplate(imageId: imageId, guestOS: "linux") {
+                                // Clone from a pre-registered template
                                 if isQEMU {
                                     logger.info("[\(env.id)] cloning QEMU template \(imageId)")
                                     try templateManager.cloneQEMUTemplate(imageId: imageId, toBundlePath: bundlePath)
@@ -42,71 +85,77 @@ enum NodeAgentHelpers {
                                     try templateManager.cloneLinuxTemplate(imageId: imageId, toBundlePath: bundlePath)
                                 }
                                 logger.info("[\(env.id)] template cloned")
+                            } else if env.iso_url == "pending-upload" {
+                                // ISO upload still in progress, wait
+                                continue
                             } else {
                                 let imageDesc = env.image_id ?? "nil"
-                                logger.error("[\(env.id)] no template for Linux image \(imageDesc) — Linux images must be pre-registered")
+                                logger.error("[\(env.id)] no template for image \(imageDesc) — images must be pre-registered")
                                 let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
                                 continue
                             }
 
                             // Write cloud-init seed files for Linux guest provisioning
-                            let sharedPath = "\(bundlePath)/shared"
-                            try FileManager.default.createDirectory(
-                                atPath: sharedPath,
-                                withIntermediateDirectories: true
-                            )
+                            // (skipped for non-Linux guests like Windows)
+                            if guestOS == "linux" {
+                                let sharedPath = "\(bundlePath)/shared"
+                                try FileManager.default.createDirectory(
+                                    atPath: sharedPath,
+                                    withIntermediateDirectories: true
+                                )
 
-                            let shortId = String(env.id.prefix(8))
-                            let hostname = "orion-\(shortId)"
+                                let shortId = String(env.id.prefix(8))
+                                let hostname = "orion-\(shortId)"
 
-                            var sshKeys: [String] = []
-                            if let ownerId = env.owner_user_id {
-                                let keys = try await api.listUserSSHKeys(userId: ownerId)
-                                sshKeys = keys.compactMap(\.public_key)
-                            }
-
-                            // meta-data (instance identity)
-                            let metaData = """
-                            instance-id: \(env.id)
-                            local-hostname: \(hostname)
-                            """
-                            try metaData.write(
-                                toFile: "\(sharedPath)/meta-data",
-                                atomically: true,
-                                encoding: .utf8
-                            )
-
-                            // user-data (cloud-init config)
-                            var userData = """
-                            #cloud-config
-                            hostname: \(hostname)
-                            manage_etc_hosts: true
-                            """
-                            if !sshKeys.isEmpty {
-                                userData += "\nssh_authorized_keys:\n"
-                                for key in sshKeys {
-                                    userData += "  - \(key)\n"
+                                var sshKeys: [String] = []
+                                if let ownerId = env.owner_user_id {
+                                    let keys = try await api.listUserSSHKeys(userId: ownerId)
+                                    sshKeys = keys.compactMap(\.public_key)
                                 }
-                            }
-                            try userData.write(
-                                toFile: "\(sharedPath)/user-data",
-                                atomically: true,
-                                encoding: .utf8
-                            )
 
-                            // Write authorized_keys for the guest agent to sync
-                            if !sshKeys.isEmpty {
-                                let keysContent = sshKeys.joined(separator: "\n") + "\n"
-                                try keysContent.write(
-                                    toFile: "\(sharedPath)/authorized_keys",
+                                // meta-data (instance identity)
+                                let metaData = """
+                                instance-id: \(env.id)
+                                local-hostname: \(hostname)
+                                """
+                                try metaData.write(
+                                    toFile: "\(sharedPath)/meta-data",
                                     atomically: true,
                                     encoding: .utf8
                                 )
+
+                                // user-data (cloud-init config)
+                                var userData = """
+                                #cloud-config
+                                hostname: \(hostname)
+                                manage_etc_hosts: true
+                                """
+                                if !sshKeys.isEmpty {
+                                    userData += "\nssh_authorized_keys:\n"
+                                    for key in sshKeys {
+                                        userData += "  - \(key)\n"
+                                    }
+                                }
+                                try userData.write(
+                                    toFile: "\(sharedPath)/user-data",
+                                    atomically: true,
+                                    encoding: .utf8
+                                )
+
+                                // Write authorized_keys for the guest agent to sync
+                                if !sshKeys.isEmpty {
+                                    let keysContent = sshKeys.joined(separator: "\n") + "\n"
+                                    try keysContent.write(
+                                        toFile: "\(sharedPath)/authorized_keys",
+                                        atomically: true,
+                                        encoding: .utf8
+                                    )
+                                }
+
+                                logger.info("[\(env.id)] cloud-init seed written: \(sshKeys.count) SSH key(s), hostname=\(hostname)")
                             }
 
-                            logger.info("[\(env.id)] cloud-init seed written: \(sshKeys.count) SSH key(s), hostname=\(hostname)")
-
-                            try await vmManager.createVM(envId: env.id, guestOS: "linux", guestArch: guestArch)
+                            try await vmManager.createVM(envId: env.id, guestOS: guestOS, guestArch: guestArch)
                         } else {
                             // macOS guest: IPSW restore or golden image clone
                             if !ipswRestore.isInstalled(bundlePath: bundlePath) {
@@ -252,11 +301,18 @@ enum NodeAgentHelpers {
                     logger.info("[\(env.id)] destroying VM")
                     do {
                         try await vmManager.destroyVM(envId: env.id)
+                    } catch {
+                        logger.warning("[\(env.id)] VM destroy error (cleaning up anyway): \(error)")
+                        // Force-remove the bundle even if VM stop failed
+                        let bundlePath = vmManager.bundlePath(envId: env.id)
+                        try? FileManager.default.removeItem(atPath: bundlePath)
+                    }
+                    // Always delete from DB regardless of VM stop result
+                    do {
                         try await api.deleteEnvironment(envId: env.id)
                         logger.info("[\(env.id)] VM destroyed")
                     } catch {
-                        logger.error("[\(env.id)] failed to destroy: \(error)")
-                        let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
+                        logger.error("[\(env.id)] failed to delete environment from API: \(error)")
                     }
 
                 case "running":
@@ -356,6 +412,35 @@ enum NodeAgentHelpers {
                                 logger: logger
                             )
                         }
+                    }
+
+                case "capturing":
+                    guard let captureImageId = env.capture_image_id else {
+                        logger.error("[\(env.id)] capturing state but no capture_image_id")
+                        let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
+                        continue
+                    }
+                    logger.info("[\(env.id)] capturing as image \(captureImageId)")
+                    do {
+                        let bundlePath = vmManager.bundlePath(envId: env.id)
+                        let templateDir = templateManager.templatePath(imageId: captureImageId)
+                        try FileManager.default.createDirectory(atPath: templateDir, withIntermediateDirectories: true)
+
+                        // Copy disk image to template
+                        let srcDisk = "\(bundlePath)/disk.img"
+                        let dstDisk = "\(templateDir)/disk.img"
+                        if FileManager.default.fileExists(atPath: dstDisk) {
+                            try FileManager.default.removeItem(atPath: dstDisk)
+                        }
+                        try FileManager.default.copyItem(atPath: srcDisk, toPath: dstDisk)
+                        FileManager.default.createFile(atPath: "\(templateDir)/installed", contents: nil)
+
+                        logger.info("[\(env.id)] image captured to \(templateDir)")
+                        // Transition back to running (or suspended)
+                        let _ = try await api.updateEnvironmentState(envId: env.id, state: "running")
+                    } catch {
+                        logger.error("[\(env.id)] capture failed: \(error)")
+                        let _ = try? await api.updateEnvironmentState(envId: env.id, state: "failed")
                     }
 
                 default:

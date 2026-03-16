@@ -251,7 +251,7 @@ export default function NodesPage() {
                       capacity={usage.disk_bytes_capacity}
                     />
                     <div className="flex justify-between text-xs text-gray-400">
-                      <span>Environments</span>
+                      <span>Machines</span>
                       <span>
                         {usage.environment_count} / {usage.max_environments}
                       </span>

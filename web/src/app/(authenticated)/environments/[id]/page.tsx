@@ -14,6 +14,7 @@ const TRANSIENT_STATES = new Set([
   "rebooting",
   "migrating",
   "destroying",
+  "capturing",
 ]);
 
 export default function EnvironmentDetailPage() {
@@ -33,6 +34,9 @@ export default function EnvironmentDetailPage() {
   const [creatingSnapshot, setCreatingSnapshot] = useState(false);
   const [editingName, setEditingName] = useState(false);
   const [nameInput, setNameInput] = useState("");
+  const [showCaptureModal, setShowCaptureModal] = useState(false);
+  const [captureImageName, setCaptureImageName] = useState("");
+  const [capturing, setCapturing] = useState(false);
 
   const fetchEnvironment = useCallback(async () => {
     try {
@@ -124,6 +128,21 @@ export default function EnvironmentDetailPage() {
     }
   }
 
+  async function handleCaptureImage() {
+    if (!captureImageName.trim()) return;
+    setCapturing(true);
+    try {
+      await api.captureImage(envId, captureImageName.trim());
+      setShowCaptureModal(false);
+      setCaptureImageName("");
+      await fetchEnvironment();
+    } catch (err) {
+      console.error("Failed to capture image:", err);
+    } finally {
+      setCapturing(false);
+    }
+  }
+
   async function handleCreateSnapshot() {
     setCreatingSnapshot(true);
     try {
@@ -149,7 +168,7 @@ export default function EnvironmentDetailPage() {
   if (!env) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-zinc-400">Environment not found.</div>
+        <div className="text-zinc-400">Machine not found.</div>
       </div>
     );
   }
@@ -407,7 +426,15 @@ export default function EnvironmentDetailPage() {
               className="border-green-700 text-green-400 hover:bg-green-900/30"
             />
           )}
-          {(state === "running" || state === "suspended" || state === "failed" || isTransient) && (
+          {(state === "running" || state === "suspended") && isAgentManaged && (
+            <ActionButton
+              label="Save as Image"
+              onClick={() => setShowCaptureModal(true)}
+              loading={false}
+              className="border-indigo-700 text-indigo-400 hover:bg-indigo-900/30"
+            />
+          )}
+          {(state === "running" || state === "suspended" || state === "failed") && (
             <ActionButton
               label="Destroy"
               onClick={() => setShowDestroyModal(true)}
@@ -468,9 +495,9 @@ export default function EnvironmentDetailPage() {
       {showDestroyModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
           <div className="rounded-xl border border-zinc-700 bg-zinc-900 p-6 w-full max-w-md shadow-xl">
-            <h3 className="text-lg font-semibold text-zinc-100">Destroy Environment</h3>
+            <h3 className="text-lg font-semibold text-zinc-100">Destroy Machine</h3>
             <p className="mt-2 text-sm text-zinc-400">
-              Are you sure you want to destroy this environment? This action cannot be undone.
+              Are you sure you want to destroy this machine? This action cannot be undone.
             </p>
             <div className="mt-6 flex justify-end gap-3">
               <button
@@ -485,6 +512,41 @@ export default function EnvironmentDetailPage() {
                 className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50 transition-colors"
               >
                 {actionLoading === "destroy" ? "Destroying..." : "Destroy"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Capture Image Modal */}
+      {showCaptureModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="rounded-xl border border-zinc-700 bg-zinc-900 p-6 w-full max-w-md shadow-xl">
+            <h3 className="text-lg font-semibold text-zinc-100">Save as Image</h3>
+            <p className="mt-2 text-sm text-zinc-400">
+              Save this machine as a reusable image template.
+            </p>
+            <input
+              type="text"
+              value={captureImageName}
+              onChange={(e) => setCaptureImageName(e.target.value)}
+              placeholder="Image name (e.g. Windows 11)"
+              autoFocus
+              className="mt-4 w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 placeholder-zinc-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            />
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setShowCaptureModal(false)}
+                className="rounded-lg border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleCaptureImage}
+                disabled={capturing || !captureImageName.trim()}
+                className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50 transition-colors"
+              >
+                {capturing ? "Saving..." : "Save"}
               </button>
             </div>
           </div>

@@ -403,6 +403,54 @@ export async function togglePortForwarding(
   });
 }
 
+export async function uploadIso(
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<{ path: string; filename: string; size: number }> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const token = getToken();
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BASE_URL}/v1/uploads/iso`);
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status === 401) {
+        clearToken();
+        if (typeof window !== "undefined") window.location.href = "/login";
+        reject(new ApiError(401, "Unauthorized"));
+        return;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(JSON.parse(xhr.responseText));
+      } else {
+        reject(new ApiError(xhr.status, xhr.responseText));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error("Upload failed"));
+    xhr.send(formData);
+  });
+}
+
+export async function captureImage(
+  envId: string,
+  name: string,
+): Promise<Image> {
+  return request<Image>(`/v1/environments/${envId}/capture-image`, {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
 export async function renameEnvironment(
   envId: string,
   name: string,
@@ -542,6 +590,8 @@ export const api = {
   forceRebootEnvironment,
   restartEnvironment,
   migrateEnvironment,
+  uploadIso,
+  captureImage,
   renameEnvironment,
   togglePortForwarding,
   extendEnvironmentTtl,

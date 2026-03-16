@@ -13,6 +13,7 @@ export type EnvironmentState =
   | "rebooting"
   | "migrating"
   | "destroying"
+  | "capturing"
   | "failed";
 
 export type TaskState = "pending" | "running" | "completed" | "failed";
@@ -95,6 +96,8 @@ export interface Environment {
   ssh_port: number | null;
   vnc_host: string | null;
   vnc_port: number | null;
+  iso_url: string | null;
+  capture_image_id: string | null;
 }
 
 export interface Snapshot {
@@ -182,9 +185,12 @@ export interface LoginRequest {
 }
 
 export interface CreateEnvironmentRequest {
-  image_id: string;
+  image_id?: string;
+  iso_url?: string;
   name?: string;
   node_id?: string;
+  guest_os?: string;
+  guest_arch?: string;
   ttl_seconds?: number;
   vcpus?: number;
   memory_bytes?: number;

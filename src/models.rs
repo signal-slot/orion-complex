@@ -73,6 +73,8 @@ pub struct Environment {
     pub ssh_port: Option<i64>,
     pub vnc_host: Option<String>,
     pub vnc_port: Option<i64>,
+    pub iso_url: Option<String>,
+    pub capture_image_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -132,13 +134,21 @@ pub struct WebauthnChallenge {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateEnvironmentRequest {
-    pub image_id: String,
+    pub image_id: Option<String>,
+    pub iso_url: Option<String>,
     pub name: Option<String>,
     pub node_id: Option<String>,
+    pub guest_os: Option<String>,
+    pub guest_arch: Option<String>,
     pub ttl_seconds: Option<i64>,
     pub vcpus: Option<i64>,
     pub memory_bytes: Option<i64>,
     pub disk_bytes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CaptureImageRequest {
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]

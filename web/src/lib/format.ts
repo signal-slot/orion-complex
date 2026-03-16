@@ -54,6 +54,8 @@ export function stateColor(state: EnvironmentState | string | null): string {
     case "migrating":
     case "destroying":
       return "bg-yellow-100 text-yellow-800";
+    case "capturing":
+      return "bg-indigo-100 text-indigo-800";
     case "suspended":
       return "bg-gray-100 text-gray-800";
     case "failed":

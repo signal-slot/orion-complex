@@ -26,6 +26,7 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub vm_provider: Arc<dyn VmProvider>,
     pub webauthn: Arc<Webauthn>,
+    pub data_dir: String,
 }
 
 pub fn unix_now() -> i64 {

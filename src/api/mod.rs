@@ -10,6 +10,7 @@ pub mod ssh_keys;
 pub mod tasks;
 pub mod users;
 pub mod webauthn;
+pub mod uploads;
 pub mod ws;
 
 use axum::Router;
@@ -33,6 +34,7 @@ pub fn router() -> Router<AppState> {
         .merge(tasks::routes())
         .merge(events::routes())
         .merge(webauthn::routes())
+        .merge(uploads::routes())
         .merge(ws::routes())
 }
 

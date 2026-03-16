@@ -386,6 +386,12 @@ final class VMManager {
             "-device", "virtio-rng-pci",
         ]
 
+        // Attach install ISO if present (for ISO-based installs)
+        let installISOPath = "\(bundlePath)/install.iso"
+        if FileManager.default.fileExists(atPath: installISOPath) {
+            args += ["-cdrom", installISOPath, "-boot", "d"]
+        }
+
         // Attach cloud-init ISO if present
         if FileManager.default.fileExists(atPath: ciISOPath) {
             args += ["-drive", "file=\(ciISOPath),format=raw,if=virtio,readonly=on"]
@@ -501,11 +507,31 @@ final class VMManager {
 
         if running.vm.canRequestStop {
             try running.vm.requestStop()
-            try await Task.sleep(nanoseconds: 5_000_000_000)
+            // Wait up to 10s for graceful shutdown
+            for _ in 0..<20 {
+                try await Task.sleep(nanoseconds: 500_000_000)
+                if running.vm.state == .stopped { break }
+            }
         }
 
         if running.vm.state != .stopped {
-            try await stopVMOnMain(running.vm)
+            // Force stop with timeout
+            do {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        try await self.stopVMOnMain(running.vm)
+                    }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: 10_000_000_000)
+                        throw VMError.notFound("force stop timeout")
+                    }
+                    // Wait for whichever finishes first
+                    try await group.next()
+                    group.cancelAll()
+                }
+            } catch {
+                logger.warning("force stop timed out for \(envId), proceeding with cleanup")
+            }
         }
 
         // Remove the bundle directory

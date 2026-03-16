@@ -81,6 +81,7 @@ mod helpers {
             http_client: reqwest::Client::new(),
             vm_provider,
             webauthn,
+            data_dir: "/tmp/orion-test".into(),
         };
 
         let app = orion_complex::api::router()

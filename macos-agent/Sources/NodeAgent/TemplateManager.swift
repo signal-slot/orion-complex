@@ -11,6 +11,11 @@ final class TemplateManager {
         self.imagesPath = "\(bundleStorePath)/images"
     }
 
+    /// Returns the path to the template directory for a given image ID.
+    func templatePath(imageId: String) -> String {
+        return "\(imagesPath)/\(imageId)"
+    }
+
     /// Check if a local golden image template exists for the given image ID (defaults to macOS).
     func hasTemplate(imageId: String) -> Bool {
         return hasTemplate(imageId: imageId, guestOS: "macos")

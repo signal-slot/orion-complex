@@ -56,6 +56,8 @@ actor APIClient {
         let ssh_port: Int?
         let vnc_host: String?
         let vnc_port: Int?
+        let iso_url: String?
+        let capture_image_id: String?
     }
 
     func listEnvironments() async throws -> [Environment] {
