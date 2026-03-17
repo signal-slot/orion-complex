@@ -65,7 +65,7 @@ async fn powershell(script: &str) -> Result<String, String> {
 
 /// Run a PowerShell command, ignoring output.
 async fn powershell_ok(script: &str) -> Result<(), String> {
-    powershell(script).map(|_| ())
+    powershell(script).await.map(|_| ())
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

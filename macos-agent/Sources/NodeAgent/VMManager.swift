@@ -551,6 +551,8 @@ final class VMManager {
                 }
 
                 if FileManager.default.fileExists(atPath: unattendISO) {
+                    // Attach as additional CD-ROM — Windows Setup searches all
+                    // removable media (including CD/DVD drives) for autounattend.xml
                     args += ["-drive", "file=\(unattendISO),media=cdrom,index=2"]
                     logger.info("[\(envId)] attached autounattend ISO")
                 }

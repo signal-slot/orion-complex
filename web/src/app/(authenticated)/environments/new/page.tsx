@@ -57,15 +57,19 @@ export default function NewEnvironmentPage() {
   const [diskBytes, setDiskBytes] = useState(DISK_OPTIONS[1].value);
   const [ttlHours, setTtlHours] = useState("");
 
+  const [existingIsos, setExistingIsos] = useState<{ path: string; filename: string; size: number }[]>([]);
+
   useEffect(() => {
     async function fetchData() {
       try {
-        const [imgs, nds] = await Promise.all([
+        const [imgs, nds, isos] = await Promise.all([
           api.listImages(),
           api.listNodes(),
+          api.listIsos(),
         ]);
         setImages(imgs);
         setNodes(nds);
+        setExistingIsos(isos);
         if (imgs.length > 0) {
           setImageId(imgs[0].id);
         }
@@ -224,30 +228,57 @@ export default function NewEnvironmentPage() {
                 ISO
               </label>
               <div className="space-y-2">
-                <label className="flex items-center gap-3 rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 cursor-pointer hover:border-zinc-600 transition-colors">
-                  <span className="text-sm text-zinc-400 shrink-0">
-                    {isoFile ? isoFile.name : "Choose file..."}
-                  </span>
-                  <input
-                    type="file"
-                    accept=".iso,.img"
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) { setIsoFile(f); setIsoUrl(""); }
-                    }}
-                  />
-                </label>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-zinc-600">or URL:</span>
-                  <input
-                    type="text"
+                {existingIsos.length > 0 && (
+                  <select
                     value={isoUrl}
                     onChange={(e) => { setIsoUrl(e.target.value); setIsoFile(null); }}
-                    placeholder="https://..."
-                    className={`flex-1 ${inputClass}`}
-                  />
-                </div>
+                    className={inputClass}
+                  >
+                    <option value="">Select uploaded ISO or upload new...</option>
+                    {existingIsos.map((iso) => (
+                      <option key={iso.path} value={iso.path}>
+                        {iso.filename} ({(iso.size / 1024 / 1024 / 1024).toFixed(1)} GB)
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {!isoUrl && (
+                  <>
+                    <label className="flex items-center gap-3 rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 cursor-pointer hover:border-zinc-600 transition-colors">
+                      <span className="text-sm text-zinc-400 shrink-0">
+                        {isoFile ? isoFile.name : "Upload new ISO..."}
+                      </span>
+                      <input
+                        type="file"
+                        accept=".iso,.img"
+                        className="hidden"
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) { setIsoFile(f); setIsoUrl(""); }
+                        }}
+                      />
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-zinc-600">or URL:</span>
+                      <input
+                        type="text"
+                        value={isoUrl}
+                        onChange={(e) => { setIsoUrl(e.target.value); setIsoFile(null); }}
+                        placeholder="https://..."
+                        className={`flex-1 ${inputClass}`}
+                      />
+                    </div>
+                  </>
+                )}
+                {isoUrl && existingIsos.some((iso) => iso.path === isoUrl) && (
+                  <button
+                    type="button"
+                    onClick={() => setIsoUrl("")}
+                    className="text-xs text-zinc-500 hover:text-zinc-300"
+                  >
+                    Change ISO
+                  </button>
+                )}
               </div>
               {uploading && (
                 <div className="mt-2">

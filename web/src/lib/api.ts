@@ -403,6 +403,12 @@ export async function togglePortForwarding(
   });
 }
 
+export async function listIsos(): Promise<
+  { path: string; filename: string; size: number }[]
+> {
+  return request("/v1/uploads/iso");
+}
+
 export async function uploadIso(
   file: File,
   onProgress?: (pct: number) => void,
@@ -600,6 +606,7 @@ export const api = {
   forceRebootEnvironment,
   restartEnvironment,
   migrateEnvironment,
+  listIsos,
   uploadIso,
   updateIsoUrl,
   captureImage,
