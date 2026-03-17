@@ -194,6 +194,8 @@ async fn register_complete(
         .execute(&state.db)
         .await?;
 
+        let _ = super::ssh_keys::generate_ssh_key_for_user(&state.db, &user_id).await;
+
         sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
             .bind(&user_id)
             .fetch_one(&state.db)
@@ -533,6 +535,8 @@ async fn totp_verify(
         .bind(now)
         .execute(&state.db)
         .await?;
+
+        let _ = super::ssh_keys::generate_ssh_key_for_user(&state.db, &user_id).await;
 
         sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
             .bind(&user_id)

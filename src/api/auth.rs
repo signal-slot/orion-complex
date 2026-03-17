@@ -110,6 +110,9 @@ async fn login(
             .execute(&state.db)
             .await?;
 
+            // Generate SSH key for the new user
+            let _ = super::ssh_keys::generate_ssh_key_for_user(&state.db, &id).await;
+
             sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
                 .bind(&id)
                 .fetch_one(&state.db)

@@ -93,6 +93,75 @@ async fn delete_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Generate an Ed25519 SSH key pair and register the public key for a user.
+/// Called automatically when a new user account is created.
+pub async fn generate_ssh_key_for_user(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<(), String> {
+    use std::process::Command;
+
+    let tmp_dir = std::env::temp_dir().join(format!("orion-ssh-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("failed to create temp dir: {e}"))?;
+
+    let key_path = tmp_dir.join("id_ed25519");
+    let key_path_str = key_path.to_string_lossy().to_string();
+
+    // Generate Ed25519 key pair with no passphrase
+    let output = Command::new("ssh-keygen")
+        .args([
+            "-t", "ed25519",
+            "-f", &key_path_str,
+            "-N", "",
+            "-C", &format!("orion-{user_id}"),
+        ])
+        .output()
+        .map_err(|e| format!("ssh-keygen failed: {e}"))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(format!(
+            "ssh-keygen error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let pub_key = std::fs::read_to_string(format!("{key_path_str}.pub"))
+        .map_err(|e| format!("failed to read public key: {e}"))?
+        .trim()
+        .to_string();
+
+    let fingerprint = pub_key
+        .split_whitespace()
+        .nth(1)
+        .map(|body| {
+            let len = body.len().min(16);
+            format!("SHA256:{}", &body[..len])
+        })
+        .unwrap_or_default();
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::unix_now();
+
+    let _ = sqlx::query(
+        "INSERT INTO user_ssh_keys (id, user_id, public_key, fingerprint, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(user_id)
+    .bind(&pub_key)
+    .bind(&fingerprint)
+    .bind(now)
+    .execute(db)
+    .await;
+
+    // Clean up temp files
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    tracing::info!(user_id = %user_id, "generated SSH key for new user");
+    Ok(())
+}
+
 /// Provisioning endpoint: returns SSH keys for a given user.
 /// Used by node agents to sync keys into guest VMs.
 async fn list_user_keys(
