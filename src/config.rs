@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub database_url: String,
+    /// VM provider backend: "libvirt" (Linux/KVM) or "hyperv" (Windows/Hyper-V).
+    pub vm_provider: String,
     pub libvirt_uri: String,
     pub data_dir: String,
     pub cors_origins: Option<Vec<String>>,
@@ -34,6 +36,9 @@ impl Config {
             let db_path = std::path::Path::new(&data_dir).join("orion-complex.db");
             format!("sqlite:{}?mode=rwc", db_path.display())
         });
+
+        let vm_provider =
+            env::var("VM_PROVIDER").unwrap_or_else(|_| "libvirt".into());
 
         let libvirt_uri =
             env::var("LIBVIRT_URI").unwrap_or_else(|_| "qemu:///system".into());
@@ -69,6 +74,7 @@ impl Config {
         Self {
             listen_addr,
             database_url,
+            vm_provider,
             libvirt_uri,
             data_dir,
             cors_origins,

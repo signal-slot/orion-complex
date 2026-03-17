@@ -14,7 +14,7 @@ use crate::models::{
     RenameEnvironmentRequest, UsbAttachment,
 };
 use crate::tasks;
-use crate::vm::VmCreateParams;
+use crate::vm::{VmCreateParams, provider_id_for};
 
 use super::{PaginationParams, check_env_owner, fetch_env};
 
@@ -220,10 +220,10 @@ async fn create_environment(
         }
         None => {
             // Scheduler: pick first online node matching host_os + under capacity limits
-            let host_os_filter = if is_agent_managed(&provider) {
-                "macos"
-            } else {
-                "linux"
+            let host_os_filter = match provider.as_str() {
+                "macos" | "virtualization" => "macos",
+                "hyperv" => "windows",
+                _ => "linux",
             };
             let is_agent: i32 = if is_agent_managed(&provider) { 1 } else { 0 };
             sqlx::query_as::<_, crate::models::Node>(
@@ -489,6 +489,7 @@ async fn destroy_environment(
         let db = state.db.clone();
         let libvirt_uri = state.libvirt_uri.clone();
         let env_id_clone = env_id.clone();
+        let provider_id = provider_id_for(provider, &env_id);
         tokio::spawn(async move {
             let _ = tasks::update_task_state(&db, &task_id, "running").await;
 
@@ -512,7 +513,6 @@ async fn destroy_environment(
                 }
             }
 
-            let provider_id = format!("libvirt-{env_id_clone}");
             match vm_provider.destroy_vm(&provider_id).await {
                 Ok(()) => {
                     crate::delete_environment_cascade(&db, &env_id_clone).await;
@@ -580,7 +580,7 @@ async fn ssh_endpoint(
         })));
     }
 
-    let provider_id = format!("libvirt-{}", env.id);
+    let provider_id = provider_id_for(provider, &env.id);
     let info = state
         .vm_provider
         .get_vm_info(&provider_id)
@@ -625,7 +625,7 @@ async fn vnc_endpoint(
         ));
     }
 
-    let provider_id = format!("libvirt-{}", env.id);
+    let provider_id = provider_id_for(provider, &env.id);
     let info = state
         .vm_provider
         .get_vm_info(&provider_id)
@@ -888,7 +888,8 @@ async fn suspend(
 ) -> Result<Json<Environment>, AppError> {
     let env = transition_state(&state, &env_id, &user.0, &["running"], "suspending").await?;
 
-    let is_agent = is_agent_managed(env.0.provider.as_deref().unwrap_or("libvirt"));
+    let suspend_provider = env.0.provider.as_deref().unwrap_or("libvirt");
+    let is_agent = is_agent_managed(suspend_provider);
     if !is_agent {
         let task_id = tasks::create_task_for_env(&state.db, &format!("suspend_env:{env_id}"), Some(&env_id))
             .await
@@ -896,9 +897,9 @@ async fn suspend(
         let vm_provider = state.vm_provider.clone();
         let db = state.db.clone();
         let env_id_clone = env_id.clone();
+        let provider_id = provider_id_for(suspend_provider, &env_id);
         tokio::spawn(async move {
             let _ = tasks::update_task_state(&db, &task_id, "running").await;
-            let provider_id = format!("libvirt-{env_id_clone}");
             match vm_provider.suspend_vm(&provider_id).await {
                 Ok(()) => {
                     let _ =
@@ -932,7 +933,8 @@ async fn resume(
 ) -> Result<Json<Environment>, AppError> {
     let env = transition_state(&state, &env_id, &user.0, &["suspended"], "resuming").await?;
 
-    let is_agent = is_agent_managed(env.0.provider.as_deref().unwrap_or("libvirt"));
+    let resume_provider = env.0.provider.as_deref().unwrap_or("libvirt");
+    let is_agent = is_agent_managed(resume_provider);
     if !is_agent {
         let task_id = tasks::create_task_for_env(&state.db, &format!("resume_env:{env_id}"), Some(&env_id))
             .await
@@ -940,9 +942,9 @@ async fn resume(
         let vm_provider = state.vm_provider.clone();
         let db = state.db.clone();
         let env_id_clone = env_id.clone();
+        let provider_id = provider_id_for(resume_provider, &env_id);
         tokio::spawn(async move {
             let _ = tasks::update_task_state(&db, &task_id, "running").await;
-            let provider_id = format!("libvirt-{env_id_clone}");
             match vm_provider.resume_vm(&provider_id).await {
                 Ok(()) => {
                     let _ =
@@ -976,7 +978,8 @@ async fn reboot(
 ) -> Result<Json<Environment>, AppError> {
     let env = transition_state(&state, &env_id, &user.0, &["running"], "rebooting").await?;
 
-    let is_agent = is_agent_managed(env.0.provider.as_deref().unwrap_or("libvirt"));
+    let reboot_provider = env.0.provider.as_deref().unwrap_or("libvirt");
+    let is_agent = is_agent_managed(reboot_provider);
     if !is_agent {
         let task_id = tasks::create_task_for_env(&state.db, &format!("reboot_env:{env_id}"), Some(&env_id))
             .await
@@ -984,9 +987,9 @@ async fn reboot(
         let vm_provider = state.vm_provider.clone();
         let db = state.db.clone();
         let env_id_clone = env_id.clone();
+        let provider_id = provider_id_for(reboot_provider, &env_id);
         tokio::spawn(async move {
             let _ = tasks::update_task_state(&db, &task_id, "running").await;
-            let provider_id = format!("libvirt-{env_id_clone}");
             match vm_provider.reboot_vm(&provider_id, false).await {
                 Ok(()) => {
                     let _ =
@@ -1027,7 +1030,8 @@ async fn force_reboot(
     )
     .await?;
 
-    let is_agent = is_agent_managed(env.0.provider.as_deref().unwrap_or("libvirt"));
+    let freboot_provider = env.0.provider.as_deref().unwrap_or("libvirt");
+    let is_agent = is_agent_managed(freboot_provider);
     if !is_agent {
         let task_id = tasks::create_task_for_env(&state.db, &format!("force_reboot_env:{env_id}"), Some(&env_id))
             .await
@@ -1035,9 +1039,9 @@ async fn force_reboot(
         let vm_provider = state.vm_provider.clone();
         let db = state.db.clone();
         let env_id_clone = env_id.clone();
+        let provider_id = provider_id_for(freboot_provider, &env_id);
         tokio::spawn(async move {
             let _ = tasks::update_task_state(&db, &task_id, "running").await;
-            let provider_id = format!("libvirt-{env_id_clone}");
             match vm_provider.reboot_vm(&provider_id, true).await {
                 Ok(()) => {
                     let _ =
@@ -1108,10 +1112,10 @@ async fn migrate(
     }
 
     let env_provider = env.provider.as_deref().unwrap_or("libvirt");
-    let required_os = if is_agent_managed(env_provider) {
-        "macos"
-    } else {
-        "linux"
+    let required_os = match env_provider {
+        "macos" | "virtualization" => "macos",
+        "hyperv" => "windows",
+        _ => "linux",
     };
     if target.host_os.as_deref() != Some(required_os) {
         return Err(AppError::BadRequest(format!(
@@ -1152,9 +1156,9 @@ async fn migrate(
         let env_id_clone = env_id.clone();
         let target_node_id = req.target_node_id.clone();
         let target_host = target.name.clone().unwrap_or_default();
+        let provider_id = provider_id_for(env_provider, &env_id);
         tokio::spawn(async move {
             let _ = tasks::update_task_state(&db, &task_id, "running").await;
-            let provider_id = format!("libvirt-{env_id_clone}");
             match vm_provider.migrate_vm(&provider_id, &target_host).await {
                 Ok(()) => {
                     let _ = sqlx::query(

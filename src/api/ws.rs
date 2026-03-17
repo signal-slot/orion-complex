@@ -14,6 +14,7 @@ use crate::error::AppError;
 use crate::models::User;
 
 use super::environments::is_agent_managed;
+use crate::vm::provider_id_for;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -66,7 +67,7 @@ async fn resolve_vnc_target(
         ));
     }
 
-    let provider_id = format!("libvirt-{}", env.id);
+    let provider_id = provider_id_for(provider, &env.id);
     let info = state
         .vm_provider
         .get_vm_info(&provider_id)
@@ -121,7 +122,7 @@ async fn resolve_ssh_target(
         ));
     }
 
-    let provider_id = format!("libvirt-{}", env.id);
+    let provider_id = provider_id_for(provider, &env.id);
     let info = state
         .vm_provider
         .get_vm_info(&provider_id)

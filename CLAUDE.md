@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-orion-complex is a control-plane server for an ephemeral VM lab. It manages disposable VM environments across libvirt (Linux) and Apple Virtualization.framework + QEMU (macOS) providers. Three components work together: a Rust server, a Next.js web frontend, and a Swift macOS node agent.
+orion-complex is a control-plane server for an ephemeral VM lab. It manages disposable VM environments across libvirt (Linux), Hyper-V (Windows), and Apple Virtualization.framework + QEMU (macOS) providers. Three components work together: a Rust server, a Next.js web frontend, and a Swift macOS node agent.
 
 ## Build & Test
 
@@ -72,6 +72,7 @@ Port 2742 is the frontend port. Port 2743 is the backend port. Never use port 30
 |---|---|---|
 | `LISTEN_ADDR` | `127.0.0.1:2743` | Server bind address |
 | `DATABASE_URL` | `sqlite:{DATA_DIR}/orion-complex.db?mode=rwc` | SQLite connection string |
+| `VM_PROVIDER` | `libvirt` | VM backend: `libvirt` (Linux/KVM) or `hyperv` (Windows/Hyper-V) |
 | `LIBVIRT_URI` | `qemu:///system` | libvirt hypervisor URI |
 | `DATA_DIR` | `/var/lib/orion-complex` | VM data directory |
 | `JWT_SECRET` | `dev-secret-change-in-production` | HMAC secret for session JWTs |
@@ -112,7 +113,7 @@ The custom server (`web/server.mjs`) exists because Next.js rewrites cannot prox
 - **`api/ws.rs`** — WebSocket proxy for VNC and SSH. VNC: raw TCP relay (WebSocket ↔ `/usr/bin/nc` ↔ VM VNC port). SSH: waits for user credentials from the browser as JSON `{username, password, cols, rows}`, then authenticates via `russh` and relays PTY I/O. Both use `/usr/bin/nc` to bypass macOS 15+ Local Network Privacy.
 - **`api/uploads.rs`** — Multipart file upload handling for VM images.
 - **`tls.rs`** — Self-signed certificate generation via `rcgen` with localhost + LAN IP SANs.
-- **`vm/mod.rs`** — `VmProvider` trait. `vm/libvirt.rs` (production), `vm/stub.rs` (tests).
+- **`vm/mod.rs`** — `VmProvider` trait + `provider_id_for()` helper. `vm/libvirt.rs` (Linux/KVM), `vm/hyperv.rs` (Windows/Hyper-V), `vm/stub.rs` (tests).
 - **`background.rs`** — TTL reaper, heartbeat checker, startup reconciliation.
 
 ### macOS Agent (`macos-agent/`)

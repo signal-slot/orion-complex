@@ -1,3 +1,4 @@
+pub mod hyperv;
 pub mod libvirt;
 pub mod stub;
 
@@ -31,6 +32,12 @@ pub struct VmCreateParams {
     pub iso_url: Option<String>,
     /// Windows unattended install options (serialized JSON)
     pub win_install_options: Option<String>,
+}
+
+/// Build a provider_id from the provider name and environment ID.
+/// E.g. `provider_id_for("libvirt", "abc-123")` → `"libvirt-abc-123"`.
+pub fn provider_id_for(provider: &str, env_id: &str) -> String {
+    format!("{provider}-{env_id}")
 }
 
 /// Trait for VM provider backends (libvirt, QEMU direct, etc.)

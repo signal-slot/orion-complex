@@ -291,6 +291,7 @@ export default function NewEnvironmentPage() {
                 >
                   <option value="virtualization">macOS (QEMU)</option>
                   <option value="libvirt">Linux (KVM)</option>
+                  <option value="hyperv">Windows (Hyper-V)</option>
                 </select>
               </div>
             </div>

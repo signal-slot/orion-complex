@@ -6,7 +6,7 @@ use tokio::sync::watch;
 
 use crate::api::environments::is_agent_managed;
 use crate::events;
-use crate::vm::VmProvider;
+use crate::vm::{VmProvider, provider_id_for};
 
 pub fn spawn_reaper(
     db: SqlitePool,
@@ -66,7 +66,7 @@ async fn reap_expired(
 
         let provider = env.provider.as_deref().unwrap_or("libvirt");
         if !is_agent_managed(provider) {
-            let provider_id = format!("libvirt-{}", env.id);
+            let provider_id = provider_id_for(provider, &env.id);
             let vm = vm_provider.clone();
             let db = db.clone();
             let env_id = env.id.clone();
@@ -177,7 +177,7 @@ pub async fn reconcile_stuck_environments(db: &SqlitePool, vm_provider: &Arc<dyn
         if state == "destroying" {
             // The destroy was interrupted — finish it.
             // Best-effort VM cleanup (may already be gone).
-            let provider_id = format!("libvirt-{}", env.id);
+            let provider_id = provider_id_for(provider, &env.id);
             if let Err(e) = vm_provider.destroy_vm(&provider_id).await {
                 tracing::debug!(env_id = %env.id, error = %e, "VM already gone or destroy failed during reconciliation");
             }

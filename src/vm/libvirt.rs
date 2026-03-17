@@ -433,7 +433,7 @@ ethernets:
 
 /// Windows install options, deserialized from JSON stored in the DB.
 #[derive(Debug, Clone, serde::Deserialize)]
-struct WinInstallOptions {
+pub struct WinInstallOptions {
     bypass_tpm: Option<bool>,
     bypass_secure_boot: Option<bool>,
     bypass_ram: Option<bool>,
@@ -448,7 +448,7 @@ struct WinInstallOptions {
     skip_oobe: Option<bool>,
 }
 
-fn generate_autounattend_xml(opts: &WinInstallOptions) -> String {
+pub fn generate_autounattend_xml(opts: &WinInstallOptions) -> String {
     let arch = "amd64";
     let token = "31bf3856ad364e35";
     let lang = opts.language.as_deref().unwrap_or("en-US");

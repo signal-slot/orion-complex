@@ -6,6 +6,7 @@ use axum::routing::{get, post};
 
 use crate::AppState;
 use crate::api::environments::is_agent_managed;
+use crate::vm::provider_id_for;
 use crate::api::{check_env_owner, fetch_env};
 use crate::auth::AuthUser;
 use crate::error::AppError;
@@ -75,7 +76,7 @@ async fn create_snapshot(
     // Dispatch snapshot creation to VM provider
     let provider = env.provider.as_deref().unwrap_or("libvirt");
     if !is_agent_managed(provider) {
-        let provider_id = format!("libvirt-{}", env.id);
+        let provider_id = provider_id_for(provider, &env.id);
         if let Err(e) = state.vm_provider.create_snapshot(&provider_id, &id).await {
             // Clean up the DB record on failure
             let _ = sqlx::query("DELETE FROM snapshots WHERE id = ?")
@@ -105,7 +106,7 @@ async fn delete_snapshot(
     // Dispatch snapshot deletion to VM provider
     let provider = env.provider.as_deref().unwrap_or("libvirt");
     if !is_agent_managed(provider) {
-        let provider_id = format!("libvirt-{}", env.id);
+        let provider_id = provider_id_for(provider, &env.id);
         state
             .vm_provider
             .delete_snapshot(&provider_id, &snapshot_id)
@@ -155,7 +156,7 @@ async fn restore_snapshot(
 
     let provider = env.provider.as_deref().unwrap_or("libvirt");
     if !is_agent_managed(provider) {
-        let provider_id = format!("libvirt-{}", env.id);
+        let provider_id = provider_id_for(provider, &env.id);
         state
             .vm_provider
             .restore_snapshot(&provider_id, &snapshot_id)

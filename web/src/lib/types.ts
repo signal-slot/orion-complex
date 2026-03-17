@@ -20,9 +20,9 @@ export type TaskState = "pending" | "running" | "completed" | "failed";
 
 export type AuthProvider = "google" | "microsoft";
 
-export type ImageProvider = "libvirt" | "macos" | "virtualization";
+export type ImageProvider = "libvirt" | "hyperv" | "macos" | "virtualization";
 
-export type HostOs = "linux" | "macos";
+export type HostOs = "linux" | "macos" | "windows";
 
 // ── Resource Models ────────────────────────────────────────────────
 

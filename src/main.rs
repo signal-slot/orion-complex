@@ -9,6 +9,7 @@ use orion_complex::auth::AuthConfig;
 use orion_complex::config;
 use orion_complex::db;
 use orion_complex::vm::VmProvider;
+use orion_complex::vm::hyperv::HypervProvider;
 use orion_complex::vm::libvirt::LibvirtProvider;
 
 #[tokio::main]
@@ -27,7 +28,10 @@ async fn main() {
 
     let pool = db::init_pool(&config).await;
 
-    let vm_provider: Arc<dyn VmProvider> = Arc::new(LibvirtProvider::new(&config.libvirt_uri, &config.data_dir));
+    let vm_provider: Arc<dyn VmProvider> = match config.vm_provider.as_str() {
+        "hyperv" => Arc::new(HypervProvider::new(&config.data_dir)),
+        _ => Arc::new(LibvirtProvider::new(&config.libvirt_uri, &config.data_dir)),
+    };
 
     let rp_origin = url::Url::parse(&auth_config.webauthn_rp_origin)
         .expect("invalid WEBAUTHN_RP_ORIGIN");

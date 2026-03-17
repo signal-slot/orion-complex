@@ -4,6 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 
 use crate::AppState;
+use crate::vm::provider_id_for;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -129,7 +130,7 @@ async fn dashboard_data(State(state): State<AppState>) -> impl IntoResponse {
         });
 
         if e.state.as_deref() == Some("running") {
-            let provider_id = format!("libvirt-{}", e.id);
+            let provider_id = provider_id_for(e.provider.as_deref().unwrap_or("libvirt"), &e.id);
             if let Ok(info) = state.vm_provider.get_vm_info(&provider_id).await {
                 entry["vnc_host"] = serde_json::json!(info.vnc_host);
                 entry["vnc_port"] = serde_json::json!(info.vnc_port);
