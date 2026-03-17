@@ -88,24 +88,65 @@ async fn qemu_img(args: &[&str]) -> Result<(), String> {
 
 // ── XML / output parsers ────────────────────────────────────────────
 
-fn generate_domain_xml(
-    name: &str,
+/// Options controlling domain XML generation.
+struct DomainXmlOptions<'a> {
+    name: &'a str,
     vcpus: i64,
     memory_bytes: i64,
-    disk_path: &Path,
-    seed_iso_path: Option<&Path>,
-    arch: &str,
-) -> String {
-    let memory_kib = memory_bytes / 1024;
-    let arch_str = match arch {
+    disk_path: &'a Path,
+    /// cloud-init seed ISO (Linux)
+    seed_iso_path: Option<&'a Path>,
+    arch: &'a str,
+    /// true for Windows guest VMs
+    is_windows: bool,
+    /// Windows installer ISO
+    install_iso_path: Option<&'a Path>,
+    /// autounattend ISO for Windows unattended install
+    autounattend_iso_path: Option<&'a Path>,
+}
+
+fn generate_domain_xml(opts: &DomainXmlOptions) -> String {
+    let memory_kib = opts.memory_bytes / 1024;
+    let arch_str = match opts.arch {
         "arm64" | "aarch64" => "aarch64",
         _ => "x86_64",
     };
 
-    let cdrom_xml = seed_iso_path
-        .map(|p| {
-            format!(
-                r#"
+    // --- CDROM devices ---
+    let mut cdrom_xml = String::new();
+
+    // For Windows ISO install: attach the installer ISO
+    if let Some(iso) = opts.install_iso_path {
+        cdrom_xml += &format!(
+            r#"
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{}'/>
+      <target dev='hda' bus='sata'/>
+      <readonly/>
+    </disk>"#,
+            iso.display()
+        );
+    }
+
+    // Autounattend ISO for Windows
+    if let Some(iso) = opts.autounattend_iso_path {
+        cdrom_xml += &format!(
+            r#"
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{}'/>
+      <target dev='hdb' bus='sata'/>
+      <readonly/>
+    </disk>"#,
+            iso.display()
+        );
+    }
+
+    // Cloud-init seed ISO (Linux)
+    if let Some(p) = opts.seed_iso_path {
+        cdrom_xml += &format!(
+            r#"
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
       <source file='{}'/>
@@ -113,10 +154,16 @@ fn generate_domain_xml(
       <readonly/>
     </disk>
     <controller type='scsi' model='virtio-scsi'/>"#,
-                p.display()
-            )
-        })
-        .unwrap_or_default();
+            p.display()
+        );
+    }
+
+    // --- Disk bus: Windows needs SATA during install (no virtio drivers), Linux uses virtio ---
+    let (disk_dev, disk_bus) = if opts.is_windows && opts.install_iso_path.is_some() {
+        ("sda", "sata")
+    } else {
+        ("vda", "virtio")
+    };
 
     // Use OVMF for UEFI boot if available
     let ovmf_paths = [
@@ -126,8 +173,9 @@ fn generate_domain_xml(
     ];
     let ovmf_code = ovmf_paths.iter().find(|p| std::path::Path::new(p).exists());
 
-    // SMBIOS hint for cloud-init NoCloud datasource detection via qemu:commandline
-    let qemu_ns_xml = if seed_iso_path.is_some() {
+    // SMBIOS hint for cloud-init NoCloud datasource detection
+    let has_cloud_init = opts.seed_iso_path.is_some();
+    let qemu_ns_xml = if has_cloud_init {
         r#"
   <qemu:commandline>
     <qemu:arg value='-smbios'/>
@@ -137,10 +185,20 @@ fn generate_domain_xml(
         ""
     };
 
-    let domain_attrs = if seed_iso_path.is_some() {
+    let domain_attrs = if has_cloud_init {
         "type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'"
     } else {
         "type='kvm'"
+    };
+
+    // Boot order: cdrom first for ISO installs, then disk
+    let boot_xml = if opts.install_iso_path.is_some() {
+        format!(
+            r#"<boot dev='cdrom'/>
+    <boot dev='hd'/>"#
+        )
+    } else {
+        "<boot dev='hd'/>".to_string()
     };
 
     let os_xml = if let Some(fw) = ovmf_code {
@@ -148,16 +206,54 @@ fn generate_domain_xml(
             r#"<os>
     <type arch='{arch_str}' machine='q35'>hvm</type>
     <loader readonly='yes' type='pflash'>{fw}</loader>
-    <boot dev='hd'/>
+    {boot_xml}
   </os>"#
         )
     } else {
         format!(
             r#"<os>
     <type arch='{arch_str}'>hvm</type>
-    <boot dev='hd'/>
+    {boot_xml}
   </os>"#
         )
+    };
+
+    // Windows-specific features: Hyper-V enlightenments for better performance
+    let features_xml = if opts.is_windows {
+        r#"<features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+    </hyperv>
+  </features>"#
+    } else {
+        r#"<features>
+    <acpi/>
+    <apic/>
+  </features>"#
+    };
+
+    // Windows uses QXL video for better display support; Linux uses virtio
+    let video_xml = if opts.is_windows {
+        r#"<video>
+      <model type='qxl' ram='65536' vram='65536'/>
+    </video>"#
+    } else {
+        r#"<video>
+      <model type='virtio'/>
+    </video>"#
+    };
+
+    // Windows needs a USB tablet for proper mouse input
+    let input_xml = if opts.is_windows {
+        r#"
+    <input type='tablet' bus='usb'/>
+    <controller type='usb' model='qemu-xhci'/>"#
+    } else {
+        ""
     };
 
     format!(
@@ -166,15 +262,12 @@ fn generate_domain_xml(
   <memory unit='KiB'>{memory_kib}</memory>
   <vcpu>{vcpus}</vcpu>
   {os_xml}
-  <features>
-    <acpi/>
-    <apic/>
-  </features>
+  {features_xml}
   <devices>
     <disk type='file' device='disk'>
       <driver name='qemu' type='qcow2' discard='unmap'/>
       <source file='{disk_path}'/>
-      <target dev='vda' bus='virtio'/>
+      <target dev='{disk_dev}' bus='{disk_bus}'/>
     </disk>{cdrom_xml}
     <interface type='network'>
       <source network='default'/>
@@ -183,9 +276,7 @@ fn generate_domain_xml(
     <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'>
       <listen type='address' address='0.0.0.0'/>
     </graphics>
-    <video>
-      <model type='virtio'/>
-    </video>
+    {video_xml}{input_xml}
     <channel type='unix'>
       <target type='virtio' name='org.qemu.guest_agent.0'/>
     </channel>
@@ -197,12 +288,17 @@ fn generate_domain_xml(
   </devices>{qemu_ns_xml}
 </domain>"#,
         domain_attrs = domain_attrs,
-        name = name,
+        name = opts.name,
         memory_kib = memory_kib,
-        vcpus = vcpus,
+        vcpus = opts.vcpus,
         os_xml = os_xml,
-        disk_path = disk_path.display(),
+        features_xml = features_xml,
+        disk_path = opts.disk_path.display(),
+        disk_dev = disk_dev,
+        disk_bus = disk_bus,
         cdrom_xml = cdrom_xml,
+        video_xml = video_xml,
+        input_xml = input_xml,
         qemu_ns_xml = qemu_ns_xml,
     )
 }
@@ -333,6 +429,315 @@ ethernets:
     Ok(iso_path)
 }
 
+// ── Windows autounattend support ────────────────────────────────────
+
+/// Windows install options, deserialized from JSON stored in the DB.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct WinInstallOptions {
+    bypass_tpm: Option<bool>,
+    bypass_secure_boot: Option<bool>,
+    bypass_ram: Option<bool>,
+    bypass_cpu: Option<bool>,
+    language: Option<String>,
+    timezone: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    auto_login: Option<bool>,
+    auto_partition: Option<bool>,
+    product_key: Option<String>,
+    skip_oobe: Option<bool>,
+}
+
+fn generate_autounattend_xml(opts: &WinInstallOptions) -> String {
+    let arch = "amd64";
+    let token = "31bf3856ad364e35";
+    let lang = opts.language.as_deref().unwrap_or("en-US");
+
+    // -- windowsPE pass --
+    let mut run_sync_cmds = String::new();
+    let mut order = 1u32;
+    let bypasses = [
+        (opts.bypass_tpm, "BypassTPMCheck"),
+        (opts.bypass_secure_boot, "BypassSecureBootCheck"),
+        (opts.bypass_ram, "BypassRAMCheck"),
+        (opts.bypass_cpu, "BypassCPUCheck"),
+    ];
+    for (flag, name) in &bypasses {
+        if *flag == Some(true) {
+            run_sync_cmds += &format!(
+                r#"        <RunSynchronousCommand wcm:action="add">
+          <Order>{order}</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v {name} /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+"#
+            );
+            order += 1;
+        }
+    }
+
+    let mut setup_component = String::new();
+    if !run_sync_cmds.is_empty() {
+        setup_component += &format!("      <RunSynchronous>\n{run_sync_cmds}      </RunSynchronous>\n");
+    }
+    if opts.auto_partition == Some(true) {
+        setup_component += r#"      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>Primary</Type>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Format>NTFS</Format>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>1</PartitionID>
+          </InstallTo>
+        </OSImage>
+      </ImageInstall>
+"#;
+    }
+    if let Some(ref key) = opts.product_key {
+        if !key.is_empty() {
+            setup_component += &format!(
+                r#"      <UserData>
+        <ProductKey>
+          <Key>{key}</Key>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+"#
+            );
+        }
+    }
+
+    let mut windows_pe = String::new();
+    if !setup_component.is_empty() {
+        windows_pe += &format!(
+            r#"    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="{arch}"
+               publicKeyToken="{token}"
+               language="neutral"
+               versionScope="nonSxS">
+{setup_component}    </component>
+"#
+        );
+    }
+    // Language for WinPE
+    windows_pe += &format!(
+        r#"    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="{arch}"
+               publicKeyToken="{token}"
+               language="neutral"
+               versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>{lang}</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>{lang}</InputLocale>
+      <SystemLocale>{lang}</SystemLocale>
+      <UILanguage>{lang}</UILanguage>
+      <UserLocale>{lang}</UserLocale>
+    </component>
+"#
+    );
+
+    // -- specialize pass --
+    let mut specialize = String::new();
+    if let Some(ref tz) = opts.timezone {
+        if !tz.is_empty() {
+            specialize = format!(
+                r#"    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="{arch}"
+               publicKeyToken="{token}"
+               language="neutral"
+               versionScope="nonSxS">
+      <TimeZone>{tz}</TimeZone>
+    </component>
+"#
+            );
+        }
+    }
+
+    // -- oobeSystem pass --
+    let mut oobe_inner = String::new();
+    if opts.skip_oobe == Some(true) {
+        oobe_inner += r#"      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+"#;
+    }
+    if let Some(ref username) = opts.username {
+        if !username.is_empty() {
+            let password = opts.password.as_deref().unwrap_or("");
+            oobe_inner += &format!(
+                r#"      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>{username}</Name>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>{password}</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+"#
+            );
+            if opts.auto_login == Some(true) {
+                oobe_inner += &format!(
+                    r#"      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>{username}</Username>
+        <Password>
+          <Value>{password}</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <LogonCount>1</LogonCount>
+      </AutoLogon>
+"#
+                );
+            }
+        }
+    }
+
+    let mut oobe_system = String::new();
+    if !oobe_inner.is_empty() {
+        oobe_system += &format!(
+            r#"    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="{arch}"
+               publicKeyToken="{token}"
+               language="neutral"
+               versionScope="nonSxS">
+{oobe_inner}    </component>
+"#
+        );
+    }
+    // Language in oobeSystem
+    oobe_system += &format!(
+        r#"    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="{arch}"
+               publicKeyToken="{token}"
+               language="neutral"
+               versionScope="nonSxS">
+      <InputLocale>{lang}</InputLocale>
+      <SystemLocale>{lang}</SystemLocale>
+      <UILanguage>{lang}</UILanguage>
+      <UserLocale>{lang}</UserLocale>
+    </component>
+"#
+    );
+
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    xml += "<unattend xmlns=\"urn:schemas-microsoft-com:unattend\"\n";
+    xml += "          xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\">\n";
+    xml += &format!("  <settings pass=\"windowsPE\">\n{windows_pe}  </settings>\n");
+    if !specialize.is_empty() {
+        xml += &format!("  <settings pass=\"specialize\">\n{specialize}  </settings>\n");
+    }
+    xml += &format!("  <settings pass=\"oobeSystem\">\n{oobe_system}  </settings>\n");
+    xml += "</unattend>\n";
+    xml
+}
+
+/// Create an autounattend ISO from Windows install options JSON.
+async fn create_autounattend_iso(
+    env_dir: &Path,
+    win_install_options_json: &str,
+) -> Result<PathBuf, String> {
+    let opts: WinInstallOptions = serde_json::from_str(win_install_options_json)
+        .map_err(|e| format!("invalid win_install_options JSON: {e}"))?;
+
+    let unattend_dir = env_dir.join("autounattend");
+    tokio::fs::create_dir_all(&unattend_dir)
+        .await
+        .map_err(|e| format!("failed to create autounattend dir: {e}"))?;
+
+    let xml = generate_autounattend_xml(&opts);
+    let xml_path = unattend_dir.join("autounattend.xml");
+    tokio::fs::write(&xml_path, &xml)
+        .await
+        .map_err(|e| format!("failed to write autounattend.xml: {e}"))?;
+
+    let iso_path = env_dir.join("autounattend.iso");
+    let iso_str = iso_path.to_string_lossy().to_string();
+    let xml_path_str = xml_path.to_string_lossy().to_string();
+
+    let output = Command::new("mkisofs")
+        .args([
+            "-output", &iso_str,
+            "-volid", "OEMDRV",
+            "-joliet",
+            "-rock",
+            &xml_path_str,
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run mkisofs for autounattend: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("mkisofs autounattend failed: {}", stderr.trim()));
+    }
+
+    Ok(iso_path)
+}
+
+/// Download an ISO from a URL to the environment directory.
+async fn download_iso(env_dir: &Path, url: &str) -> Result<PathBuf, String> {
+    let iso_path = env_dir.join("install.iso");
+
+    // If it's a local file path, symlink it
+    if url.starts_with('/') || url.starts_with("file://") {
+        let src = if let Some(stripped) = url.strip_prefix("file://") {
+            stripped
+        } else {
+            url
+        };
+        if !Path::new(src).exists() {
+            return Err(format!("ISO file not found: {src}"));
+        }
+        tokio::fs::symlink(src, &iso_path)
+            .await
+            .map_err(|e| format!("failed to symlink ISO: {e}"))?;
+        return Ok(iso_path);
+    }
+
+    // Download via curl (handles HTTPS, redirects, large files efficiently)
+    let iso_str = iso_path.to_string_lossy().to_string();
+    let output = Command::new("curl")
+        .args(["-fSL", "-o", &iso_str, url])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ISO download failed: {}", stderr.trim()));
+    }
+
+    Ok(iso_path)
+}
+
 // ── VmProvider implementation ───────────────────────────────────────
 
 impl VmProvider for LibvirtProvider {
@@ -346,12 +751,17 @@ impl VmProvider for LibvirtProvider {
         let base_image = self.base_image_path(&params.image_name);
 
         Box::pin(async move {
+            let is_windows = params.guest_os == "windows";
+            let is_iso_install = params.iso_url.is_some();
+
             tracing::info!(
                 env_id = %params.env_id,
                 image = %params.image_name,
+                guest_os = %params.guest_os,
                 vcpus = params.vcpus,
                 memory_bytes = params.memory_bytes,
                 disk_bytes = params.disk_bytes,
+                is_iso_install = is_iso_install,
                 "creating VM via libvirt"
             );
 
@@ -381,30 +791,57 @@ impl VmProvider for LibvirtProvider {
                 .await?;
                 tracing::info!(env_id = %params.env_id, base = %base_str, "created COW overlay disk");
             } else {
-                // Empty disk
+                // Empty disk (fresh install from ISO or empty image)
                 qemu_img(&["create", "-f", "qcow2", &disk_str, &size_str]).await?;
                 tracing::info!(env_id = %params.env_id, size = %size_str, "created empty disk");
             }
 
-            // Generate cloud-init seed ISO
-            let seed_iso = create_cloud_init_seed(
-                &env_dir,
-                &params.env_id,
-                &params.ssh_authorized_keys,
-            )
-            .await
-            .ok();
+            // Download installer ISO if provided
+            let install_iso = if let Some(ref url) = params.iso_url {
+                tracing::info!(env_id = %params.env_id, url = %url, "downloading installer ISO");
+                Some(download_iso(&env_dir, url).await?)
+            } else {
+                None
+            };
+
+            // Generate autounattend ISO for Windows
+            let autounattend_iso = if is_windows {
+                if let Some(ref json) = params.win_install_options {
+                    tracing::info!(env_id = %params.env_id, "generating autounattend ISO");
+                    Some(create_autounattend_iso(&env_dir, json).await?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Generate cloud-init seed ISO (Linux only, not for Windows)
+            let seed_iso = if !is_windows {
+                create_cloud_init_seed(
+                    &env_dir,
+                    &params.env_id,
+                    &params.ssh_authorized_keys,
+                )
+                .await
+                .ok()
+            } else {
+                None
+            };
 
             // Generate and write domain XML
             let dom_name = format!("orion-{}", params.env_id);
-            let xml = generate_domain_xml(
-                &dom_name,
-                params.vcpus,
-                params.memory_bytes,
-                &disk_path,
-                seed_iso.as_deref(),
-                &params.guest_arch,
-            );
+            let xml = generate_domain_xml(&DomainXmlOptions {
+                name: &dom_name,
+                vcpus: params.vcpus,
+                memory_bytes: params.memory_bytes,
+                disk_path: &disk_path,
+                seed_iso_path: seed_iso.as_deref(),
+                arch: &params.guest_arch,
+                is_windows,
+                install_iso_path: install_iso.as_deref(),
+                autounattend_iso_path: autounattend_iso.as_deref(),
+            });
 
             let xml_path = env_dir.join("domain.xml");
             tokio::fs::write(&xml_path, &xml)
@@ -422,7 +859,8 @@ impl VmProvider for LibvirtProvider {
             let running_xml = virsh(&uri, &["dumpxml", &dom_name]).await.unwrap_or_default();
             let vnc_port = parse_vnc_port(&running_xml);
 
-            // Wait for VM to obtain an IP address (up to 30s)
+            // Wait for VM to obtain an IP address (up to 30s).
+            // Windows installs take much longer; still try so we record what we can.
             let ssh_host = wait_for_ip(&uri, &dom_name, 15)
                 .await
                 .unwrap_or_else(|| params.node_host.clone());
@@ -806,19 +1244,80 @@ mod tests {
 
     #[test]
     fn test_generate_domain_xml() {
-        let xml = generate_domain_xml(
-            "orion-test",
-            4,
-            8 * 1024 * 1024 * 1024, // 8 GB
-            Path::new("/data/test/disk.qcow2"),
-            None,
-            "x86_64",
-        );
+        let xml = generate_domain_xml(&DomainXmlOptions {
+            name: "orion-test",
+            vcpus: 4,
+            memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GB
+            disk_path: Path::new("/data/test/disk.qcow2"),
+            seed_iso_path: None,
+            arch: "x86_64",
+            is_windows: false,
+            install_iso_path: None,
+            autounattend_iso_path: None,
+        });
         assert!(xml.contains("<name>orion-test</name>"));
         assert!(xml.contains("<vcpu>4</vcpu>"));
         assert!(xml.contains("<memory unit='KiB'>8388608</memory>"));
         assert!(xml.contains("/data/test/disk.qcow2"));
         assert!(xml.contains("arch='x86_64'"));
+        assert!(xml.contains("bus='virtio'"));
+    }
+
+    #[test]
+    fn test_generate_domain_xml_windows() {
+        let xml = generate_domain_xml(&DomainXmlOptions {
+            name: "orion-win",
+            vcpus: 4,
+            memory_bytes: 8 * 1024 * 1024 * 1024,
+            disk_path: Path::new("/data/win/disk.qcow2"),
+            seed_iso_path: None,
+            arch: "x86_64",
+            is_windows: true,
+            install_iso_path: Some(Path::new("/data/win/install.iso")),
+            autounattend_iso_path: Some(Path::new("/data/win/autounattend.iso")),
+        });
+        assert!(xml.contains("<name>orion-win</name>"));
+        // Windows ISO install uses SATA bus
+        assert!(xml.contains("bus='sata'"));
+        // Boot from cdrom first
+        assert!(xml.contains("<boot dev='cdrom'/>"));
+        // Hyper-V enlightenments
+        assert!(xml.contains("<hyperv"));
+        // QXL video
+        assert!(xml.contains("type='qxl'"));
+        // USB tablet
+        assert!(xml.contains("type='tablet'"));
+        // Both ISOs attached
+        assert!(xml.contains("/data/win/install.iso"));
+        assert!(xml.contains("/data/win/autounattend.iso"));
+    }
+
+    #[test]
+    fn test_generate_autounattend_xml() {
+        let opts = WinInstallOptions {
+            bypass_tpm: Some(true),
+            bypass_secure_boot: Some(true),
+            bypass_ram: None,
+            bypass_cpu: None,
+            language: Some("en-US".into()),
+            timezone: Some("UTC".into()),
+            username: Some("admin".into()),
+            password: Some("pass123".into()),
+            auto_login: Some(true),
+            auto_partition: Some(true),
+            product_key: None,
+            skip_oobe: Some(true),
+        };
+        let xml = generate_autounattend_xml(&opts);
+        assert!(xml.contains("BypassTPMCheck"));
+        assert!(xml.contains("BypassSecureBootCheck"));
+        assert!(!xml.contains("BypassRAMCheck"));
+        assert!(xml.contains("<WillWipeDisk>true</WillWipeDisk>"));
+        assert!(xml.contains("<Name>admin</Name>"));
+        assert!(xml.contains("<Value>pass123</Value>"));
+        assert!(xml.contains("<AutoLogon>"));
+        assert!(xml.contains("<SkipMachineOOBE>true</SkipMachineOOBE>"));
+        assert!(xml.contains("<TimeZone>UTC</TimeZone>"));
     }
 
     #[test]

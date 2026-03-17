@@ -185,11 +185,12 @@ async fn create_environment(
             image.guest_arch.unwrap_or_else(|| "x86_64".into()),
         )
     } else if let Some(ref url) = req.iso_url {
-        // ISO-based creation: no base image, QEMU x86_64
+        // ISO-based creation: no base image.
+        // Default to "virtualization" (macOS agent) unless provider is explicitly set.
         (
             None,
             Some(url.clone()),
-            "virtualization".to_string(),
+            req.provider.clone().unwrap_or_else(|| "virtualization".to_string()),
             req.guest_os.clone().unwrap_or_else(|| "windows".into()),
             req.guest_arch.clone().unwrap_or_else(|| "x86_64".into()),
         )
@@ -364,6 +365,8 @@ async fn create_environment(
         let guest_os_clone = guest_os.clone();
         let guest_arch_clone = guest_arch.clone();
         let node_name = node.name.clone().unwrap_or_default();
+        let iso_url_clone = iso_url.clone();
+        let win_opts_json_clone = win_opts_json.clone();
         // Look up image name for libvirt
         let image_name = if let Some(ref img_id) = image_id {
             sqlx::query_as::<_, crate::models::Image>("SELECT * FROM images WHERE id = ?")
@@ -388,6 +391,8 @@ async fn create_environment(
                 memory_bytes,
                 disk_bytes,
                 ssh_authorized_keys: ssh_keys,
+                iso_url: iso_url_clone,
+                win_install_options: win_opts_json_clone,
             };
 
             match vm_provider.create_vm(params).await {
@@ -582,13 +587,20 @@ async fn ssh_endpoint(
         .await
         .map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::json!({
+    // Default credentials depend on guest OS — cloud-init Linux uses ubuntu/orion,
+    // Windows VMs use whatever was configured in win_install_options (no default).
+    let guest_os = env.guest_os.as_deref().unwrap_or("linux");
+    let mut resp = serde_json::json!({
         "env_id": env.id,
         "host": info.ssh_host,
         "port": info.ssh_port,
-        "username": "ubuntu",
-        "password": "orion",
-    })))
+    });
+    if guest_os != "windows" {
+        resp["username"] = serde_json::json!("ubuntu");
+        resp["password"] = serde_json::json!("orion");
+    }
+
+    Ok(Json(resp))
 }
 
 async fn vnc_endpoint(
@@ -624,8 +636,6 @@ async fn vnc_endpoint(
         "env_id": env.id,
         "host": info.vnc_host,
         "port": info.vnc_port,
-        "username": "ubuntu",
-        "password": "orion",
     })))
 }
 

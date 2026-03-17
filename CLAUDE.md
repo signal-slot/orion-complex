@@ -18,7 +18,7 @@ cargo clippy                   # lint
 cargo fmt --check              # check formatting
 ```
 
-Tests use `StubProvider` (in-process fake VM backend) and in-memory SQLite with migrations applied via `sqlx::migrate!("./migrations")`.
+Tests use `StubProvider` (in-process fake VM backend) and in-memory SQLite with migrations applied via `sqlx::migrate!("./migrations")`. Integration tests are in `tests/api_tests.rs` — they build a full `axum::Router` with `AppState`, seed test users, and use `tower::ServiceExt::oneshot()` to send requests (no live server needed). Rust edition is 2024.
 
 ### Web Frontend
 
@@ -71,7 +71,7 @@ Port 2742 is the frontend port. Port 2743 is the backend port. Never use port 30
 | Variable | Default | Purpose |
 |---|---|---|
 | `LISTEN_ADDR` | `127.0.0.1:2743` | Server bind address |
-| `DATABASE_URL` | `sqlite:orion-complex.db?mode=rwc` | SQLite connection string |
+| `DATABASE_URL` | `sqlite:{DATA_DIR}/orion-complex.db?mode=rwc` | SQLite connection string |
 | `LIBVIRT_URI` | `qemu:///system` | libvirt hypervisor URI |
 | `DATA_DIR` | `/var/lib/orion-complex` | VM data directory |
 | `JWT_SECRET` | `dev-secret-change-in-production` | HMAC secret for session JWTs |
@@ -100,11 +100,17 @@ The custom server (`web/server.mjs`) exists because Next.js rewrites cannot prox
 ### Rust Server (`src/`)
 
 - **`main.rs`** — Boots server: config, DB pool, VM provider, background tasks, axum router.
-- **`lib.rs`** — `AppState` shared across handlers: `SqlitePool`, `AuthConfig`, `reqwest::Client`, `Arc<dyn VmProvider>`.
-- **`api/`** — Route handlers by resource, each exposes `routes()` merged in `api/mod.rs`. All under `/v1/`.
+- **`lib.rs`** — `AppState` shared across handlers: `SqlitePool`, `AuthConfig`, `reqwest::Client`, `Arc<dyn VmProvider>`. Also has `delete_environment_cascade()` for cascading deletes.
+- **`config.rs`** — `Config::from_env()` reads all env vars with defaults.
+- **`db.rs`** — Creates SQLite pool, enables foreign keys per-connection, runs migrations.
+- **`models.rs`** — All DB row structs (`#[derive(sqlx::FromRow)]`) and API request types. SQLite booleans are `i64` (0/1).
+- **`error.rs`** — `AppError` enum → axum `IntoResponse` (returns `{"error": "..."}` JSON). `sqlx::Error::RowNotFound` auto-maps to 404.
+- **`events.rs`** / **`tasks.rs`** — Helpers for recording environment events and async task tracking.
+- **`api/`** — Route handlers by resource, each exposes `routes()` merged in `api/mod.rs`. All under `/v1/`. Shared `PaginationParams` and `fetch_env()` in `api/mod.rs`.
 - **`auth.rs`** — JWT session tokens + OIDC. `AuthUser` and `AdminUser` axum extractors.
 - **`api/webauthn.rs`** — TOTP (code-only login, server iterates all users) and WebAuthn passkey auth.
 - **`api/ws.rs`** — WebSocket proxy for VNC and SSH. VNC: raw TCP relay (WebSocket ↔ `/usr/bin/nc` ↔ VM VNC port). SSH: waits for user credentials from the browser as JSON `{username, password, cols, rows}`, then authenticates via `russh` and relays PTY I/O. Both use `/usr/bin/nc` to bypass macOS 15+ Local Network Privacy.
+- **`api/uploads.rs`** — Multipart file upload handling for VM images.
 - **`tls.rs`** — Self-signed certificate generation via `rcgen` with localhost + LAN IP SANs.
 - **`vm/mod.rs`** — `VmProvider` trait. `vm/libvirt.rs` (production), `vm/stub.rs` (tests).
 - **`background.rs`** — TTL reaper, heartbeat checker, startup reconciliation.
@@ -131,6 +137,7 @@ The custom server (`web/server.mjs`) exists because Next.js rewrites cannot prox
 - **Agent-managed providers**: `is_agent_managed()` returns true for `"macos"` and `"virtualization"` providers. These don't use the `VmProvider` trait — the control plane records desired state, and the node agent polls and executes.
 - **VNC/SSH proxy**: Backend uses `/usr/bin/nc` to connect to VMs (bypasses macOS Local Network Privacy). When port forwarding is off, connects to VM internal IP (`192.168.64.x`). When on, endpoints point to host LAN IP + forwarded ports. Browser noVNC works for non-macOS VMs only — macOS Screen Sharing uses proprietary Apple DH auth that noVNC doesn't support; use native `vnc://` client instead.
 - **SSH credentials**: Never auto-try passwords. The web SSH terminal prompts users for username and password, which are sent to the backend via the first WebSocket message.
+- **Windows VM support**: Both libvirt (Linux/KVM) and macOS agent (QEMU) providers support Windows guest VMs from ISO with autounattend.xml for unattended install. The `win_install_options` JSON field stores install options (hardware bypass, language, user account, auto-partition, etc.). The libvirt provider uses SATA disk bus during ISO install (no virtio drivers in Windows installer), Hyper-V enlightenments, QXL video, and USB tablet input. The `provider` field in `CreateEnvironmentRequest` controls which backend handles ISO installs (default: `"virtualization"`; use `"libvirt"` for KVM).
 - **Environment FSM**: creating → running → suspending → suspended → resuming → running. Migration only from suspended state.
 - **Auth**: TOTP is the default login method. Code-only login — server iterates all users with `totp_secret` set to find match. WebAuthn passkeys also supported.
 - **noVNC bundling**: npm package ships broken CJS with top-level `await`. Build script patches it before rollup bundles into browser IIFE. See `web/rollup.novnc.mjs` and `build:novnc` script in `package.json`.

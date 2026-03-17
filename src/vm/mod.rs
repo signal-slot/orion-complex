@@ -27,6 +27,10 @@ pub struct VmCreateParams {
     pub disk_bytes: i64,
     /// SSH public keys to inject via cloud-init
     pub ssh_authorized_keys: Vec<String>,
+    /// ISO URL for install-from-ISO creation (no base image)
+    pub iso_url: Option<String>,
+    /// Windows unattended install options (serialized JSON)
+    pub win_install_options: Option<String>,
 }
 
 /// Trait for VM provider backends (libvirt, QEMU direct, etc.)

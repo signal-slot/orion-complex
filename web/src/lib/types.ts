@@ -189,6 +189,7 @@ export interface CreateEnvironmentRequest {
   iso_url?: string;
   name?: string;
   node_id?: string;
+  provider?: string;
   guest_os?: string;
   guest_arch?: string;
   ttl_seconds?: number;

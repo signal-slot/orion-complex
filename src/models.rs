@@ -150,6 +150,7 @@ pub struct CreateEnvironmentRequest {
     pub iso_url: Option<String>,
     pub name: Option<String>,
     pub node_id: Option<String>,
+    pub provider: Option<String>,
     pub guest_os: Option<String>,
     pub guest_arch: Option<String>,
     pub ttl_seconds: Option<i64>,

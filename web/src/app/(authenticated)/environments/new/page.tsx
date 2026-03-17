@@ -37,6 +37,7 @@ export default function NewEnvironmentPage() {
   const [uploading, setUploading] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
   const [guestOs, setGuestOs] = useState("windows");
+  const [isoProvider, setIsoProvider] = useState("virtualization");
   const [winOpts, setWinOpts] = useState<WinInstallOptions>({
     bypass_tpm: true,
     bypass_secure_boot: true,
@@ -89,6 +90,7 @@ export default function NewEnvironmentPage() {
         // Create environment first to check capacity before uploading
         const env = await api.createEnvironment({
           iso_url: isoFile ? "pending-upload" : isoUrl,
+          provider: isoProvider,
           guest_os: guestOs,
           guest_arch: "x86_64",
           name: name.trim() || undefined,
@@ -262,19 +264,35 @@ export default function NewEnvironmentPage() {
                 </div>
               )}
             </div>
-            <div>
-              <label htmlFor="guest_os" className="block text-sm font-medium text-zinc-300 mb-1.5">
-                OS
-              </label>
-              <select
-                id="guest_os"
-                value={guestOs}
-                onChange={(e) => setGuestOs(e.target.value)}
-                className={inputClass}
-              >
-                <option value="windows">Windows</option>
-                <option value="linux">Linux</option>
-              </select>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="guest_os" className="block text-sm font-medium text-zinc-300 mb-1.5">
+                  OS
+                </label>
+                <select
+                  id="guest_os"
+                  value={guestOs}
+                  onChange={(e) => setGuestOs(e.target.value)}
+                  className={inputClass}
+                >
+                  <option value="windows">Windows</option>
+                  <option value="linux">Linux</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="iso_provider" className="block text-sm font-medium text-zinc-300 mb-1.5">
+                  Provider
+                </label>
+                <select
+                  id="iso_provider"
+                  value={isoProvider}
+                  onChange={(e) => setIsoProvider(e.target.value)}
+                  className={inputClass}
+                >
+                  <option value="virtualization">macOS (QEMU)</option>
+                  <option value="libvirt">Linux (KVM)</option>
+                </select>
+              </div>
             </div>
             {guestOs === "windows" && (
               <div className="space-y-4 rounded-lg border border-zinc-700 bg-zinc-800/50 p-4">
