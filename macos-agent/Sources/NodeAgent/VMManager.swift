@@ -730,21 +730,27 @@ final class VMManager {
 
         // -- oobeSystem pass --
         var oobeInner = ""
-        if opts.skip_oobe == true {
-            oobeInner += """
+
+        // Always hide Microsoft account / online screens
+        oobeInner += """
                 <OOBE>
                   <HideEULAPage>true</HideEULAPage>
                   <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
                   <ProtectYourPC>3</ProtectYourPC>
                   <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
-                  <SkipMachineOOBE>true</SkipMachineOOBE>
-                  <SkipUserOOBE>true</SkipUserOOBE>
-                </OOBE>\n
+        """
+        if opts.skip_oobe == true {
+            oobeInner += """
+                          <SkipMachineOOBE>true</SkipMachineOOBE>
+                          <SkipUserOOBE>true</SkipUserOOBE>
             """
         }
-        if let username = opts.username, !username.isEmpty {
-            let password = opts.password ?? ""
-            oobeInner += """
+        oobeInner += "        </OOBE>\n"
+
+        // Local account (default to "user" if not specified)
+        let username = (opts.username?.isEmpty == false) ? opts.username! : "user"
+        let password = opts.password ?? ""
+        oobeInner += """
                 <UserAccounts>
                   <LocalAccounts>
                     <LocalAccount wcm:action="add">
@@ -757,9 +763,9 @@ final class VMManager {
                     </LocalAccount>
                   </LocalAccounts>
                 </UserAccounts>\n
-            """
-            if opts.auto_login == true {
-                oobeInner += """
+        """
+        if opts.auto_login == true {
+            oobeInner += """
                     <AutoLogon>
                       <Enabled>true</Enabled>
                       <Username>\(username)</Username>
@@ -767,11 +773,31 @@ final class VMManager {
                         <Value>\(password)</Value>
                         <PlainText>true</PlainText>
                       </Password>
-                      <LogonCount>1</LogonCount>
+                      <LogonCount>999</LogonCount>
                     </AutoLogon>\n
-                """
-            }
+            """
         }
+
+        // FirstLogonCommands: install & enable OpenSSH Server, open firewall
+        oobeInner += """
+                <FirstLogonCommands>
+                  <SynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <CommandLine>powershell -NoProfile -Command "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"</CommandLine>
+                    <Description>Install OpenSSH Server</Description>
+                  </SynchronousCommand>
+                  <SynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <CommandLine>powershell -NoProfile -Command "Start-Service sshd; Set-Service -Name sshd -StartupType Automatic"</CommandLine>
+                    <Description>Start and enable OpenSSH Server</Description>
+                  </SynchronousCommand>
+                  <SynchronousCommand wcm:action="add">
+                    <Order>3</Order>
+                    <CommandLine>powershell -NoProfile -Command "New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22"</CommandLine>
+                    <Description>Open SSH firewall port</Description>
+                  </SynchronousCommand>
+                </FirstLogonCommands>\n
+        """
 
         var oobeSystem = ""
         if !oobeInner.isEmpty {
