@@ -25,7 +25,7 @@ NODE_ID=$(sqlite3 orion-complex.db "SELECT id FROM nodes WHERE name='mac-mini.lo
 
 # 1. Build & start backend
 echo "Starting backend..."
-DATA_DIR=$HOME/.orion TLS_ENABLED=false cargo run &
+DATABASE_URL="sqlite:orion-complex.db?mode=rwc" DATA_DIR=$HOME/.orion TLS_ENABLED=false cargo run &
 sleep 3
 
 # 2. Build, sign & start node agent

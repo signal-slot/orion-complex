@@ -81,9 +81,9 @@ final class VMManager {
     func createVM(envId: String, cpuCount: Int = 4, memoryGB: Int = 8, guestOS: String = "macos", guestArch: String? = nil, winInstallOptions: WinInstallOptions? = nil) async throws {
         // If guest arch is x86_64 on arm64 host, use QEMU emulation
         if guestArch == "x86_64" {
-            // QEMU TCG emulation is slow; use smaller defaults
-            let qemuCPUs = min(cpuCount, 2)
-            let qemuMemGB = min(memoryGB, 2)
+            // QEMU TCG emulation — pass through requested resources
+            let qemuCPUs = cpuCount
+            let qemuMemGB = memoryGB
             try await createQEMUVM(envId: envId, cpuCount: qemuCPUs, memoryGB: qemuMemGB, winInstallOptions: winInstallOptions)
             return
         }
@@ -512,7 +512,14 @@ final class VMManager {
             "-device", "\(hasISO ? "e1000" : "virtio-net-pci"),netdev=net0",
             "-display", "none",
             "-vnc", "127.0.0.1:\(vncPort - 5900)",
-            "-device", "virtio-gpu-pci",
+        ]
+        // Use standard VGA for ISO installs (Windows PE lacks virtio-gpu drivers)
+        if hasISO {
+            args += ["-vga", "std"]
+        } else {
+            args += ["-device", "virtio-gpu-pci"]
+        }
+        args += [
             "-serial", "mon:stdio",
             "-monitor", "unix:\(monitorSocket),server,nowait",
             "-device", "virtio-rng-pci",
